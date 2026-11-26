@@ -1,0 +1,35 @@
+# Secrets & credentials
+.env
+.env.*
+*.key
+*.pem
+secrets/
+
+# Raw competition datasets & spreadsheets
+data/
+datasets/
+raw_data/
+*.xlsx
+*.xls
+*.csv
+
+# Local caches, Run artifacts & Submission outputs
+work/
+cache/
+.cache/
+runs/
+submissions/
+outputs/
+
+# Python & tooling
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+.DS_Store

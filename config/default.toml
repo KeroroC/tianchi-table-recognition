@@ -1,0 +1,20 @@
+bailian_base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+work_dir = "work"
+dataset_dir = ""
+questions_file = "tests.xlsx"
+submission_template_file = "submission_template.xlsx"
+documents_dir = "."
+
+[model_roles]
+vision_extract = "qwen-vl-max"
+vision_verify = "qwen-vl-max"
+vision_triage = "qwen-vl-plus"
+text_reason = "qwen-max"
+
+[pricing_cny_per_1k_tokens]
+qwen-vl-max = { input = 0.003, output = 0.009 }
+qwen-vl-plus = { input = 0.0015, output = 0.0045 }
+qwen-max = { input = 0.0024, output = 0.0096 }
+qwen-plus = { input = 0.0008, output = 0.002 }
+qwen-turbo = { input = 0.0003, output = 0.0006 }
+default = { input = 0.002, output = 0.006 }
