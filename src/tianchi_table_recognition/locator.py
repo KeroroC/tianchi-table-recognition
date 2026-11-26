@@ -9,10 +9,12 @@ from pydantic import BaseModel, ConfigDict
 from tianchi_table_recognition.models import PageArtifact, Question, TableGrid
 from tianchi_table_recognition.text_matching import (
     extract_search_tokens,
+    extract_table_number,
     has_continuation_marker,
     has_forward_continuation_marker,
     normalize_base_title,
     normalize_text_for_match,
+    strip_table_number_prefix,
     token_overlap_score,
 )
 
@@ -77,11 +79,6 @@ def _can_link_tables(
     if next_art.tables[0].table_id != next_tbl.table_id:
         return False
 
-    prev_base = normalize_base_title(prev_tbl.title)
-    next_base = normalize_base_title(next_tbl.title)
-    if prev_base and next_base and prev_base != next_base:
-        return False
-
     explicit_next = has_continuation_marker(next_tbl.title or "") or has_continuation_marker(
         next_art.page_context_text
     )
@@ -89,7 +86,20 @@ def _can_link_tables(
         prev_tbl.title or ""
     ) or has_forward_continuation_marker(prev_art.page_context_text)
     if explicit_next or explicit_prev:
+        prev_num = extract_table_number(prev_tbl.title)
+        next_num = extract_table_number(next_tbl.title)
+        if prev_num and next_num and prev_num != next_num:
+            return False
+        prev_desc = strip_table_number_prefix(prev_tbl.title)
+        next_desc = strip_table_number_prefix(next_tbl.title)
+        if prev_desc and next_desc and prev_desc != next_desc:
+            return False
         return True
+
+    prev_base = normalize_base_title(prev_tbl.title)
+    next_base = normalize_base_title(next_tbl.title)
+    if prev_base and next_base and prev_base != next_base:
+        return False
 
     if prev_base and prev_base == next_base:
         return True

@@ -211,3 +211,32 @@ def test_extract_solver_passes_joint_continuation_context_and_validates_string(
     prompt = transport.requests[0].user_prompt
     assert "t0" in prompt and "t1" in prompt
     assert "CrossPageContinuation: true" in prompt
+
+
+def test_locator_links_numbered_continuation_title_and_rejects_mismatched_number(
+    tmp_path: Path,
+) -> None:
+    p0 = _make_page(
+        0,
+        [_grid("t0", "表1 销售明细表", [["区域", "金额"], ["华东", "100"]])],
+    )
+    p1 = _make_page(
+        1,
+        [_grid("t1", "续表1 销售明细表", [["区域", "金额"], ["华南", "200"]])],
+    )
+    p2 = _make_page(
+        2,
+        [_grid("t2", "续表2 员工统计表", [["部门", "人数"], ["研发", "50"]])],
+    )
+    q = Question(
+        id="q_num",
+        document_key=p0.document_key,
+        question_type=QuestionType.EXTRACT,
+        question="华南金额是多少？",
+        table_hint="表1 销售明细表",
+        answer_format=AnswerFormat.NUMBER,
+    )
+
+    located = TableLocator().locate(q, [p0, p1, p2])
+    assert located.has_cross_page_continuation is True
+    assert [lt.table.table_id for lt in located.tables] == ["t0", "t1"]

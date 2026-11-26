@@ -51,6 +51,39 @@ _TITLE_STRIP_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 _TITLE_PUNCT_EDGE_RE = re.compile(r"^[\s:：\-—·•.,，。;；]+|[\s:：\-—·•.,，。;；]+$")
+_CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```$", re.DOTALL | re.IGNORECASE)
+_TABLE_NUMBER_RE = re.compile(r"(?:续表|表|table)\s*(\d+)", re.IGNORECASE)
+_TABLE_NUMBER_PREFIX_RE = re.compile(r"^(?:续表|表|table)\s*\d+\s*[:：\-—.\s]*", re.IGNORECASE)
+
+
+def strip_json_fences(raw_text: str) -> str:
+    """Strip surrounding markdown JSON code fences from model output."""
+    stripped = raw_text.strip()
+    match = _CODE_FENCE_RE.match(stripped)
+    if match:
+        return match.group(1).strip()
+    return stripped
+
+
+def extract_table_number(title: str | None) -> str | None:
+    """Extract numeric table identifier from titles like '表1 ...', '续表1', or 'Table 2'."""
+    if not title:
+        return None
+    match = _TABLE_NUMBER_RE.search(title)
+    return match.group(1) if match else None
+
+
+def strip_table_number_prefix(title: str | None) -> str:
+    """Strip continuation cues and leading table numbers to compare descriptive titles."""
+    if not title:
+        return ""
+    cleaned = title
+    for pattern in _TITLE_STRIP_PATTERNS:
+        cleaned = pattern.sub(" ", cleaned)
+    cleaned = _TITLE_PUNCT_EDGE_RE.sub("", cleaned)
+    cleaned = _TABLE_NUMBER_PREFIX_RE.sub("", cleaned)
+    cleaned = _TITLE_PUNCT_EDGE_RE.sub("", cleaned)
+    return normalize_text_for_match(cleaned)
 
 
 def extract_search_tokens(text: str) -> frozenset[str]:

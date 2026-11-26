@@ -27,7 +27,8 @@ _BARE_PAGE_NUMBER_LINE_RE = re.compile(
     r"^\s*[-—–]?\s*\d+(?:\s*/\s*\d+)?\s*[-—–]?\s*$"
 )
 _WHITESPACE_RE = re.compile(r"\s+")
-_MIN_NATIVE_TEXT_CHARS = 4
+_MIN_NATIVE_TEXT_CHARS = 2
+_NATIVE_TEXT_MIN_PAGE_RATIO = 0.8
 
 
 class PreparedPage(BaseModel):
@@ -82,7 +83,7 @@ def inspect_pdf(source_path: Path) -> PdfInspection:
         doc.close()
 
     pages_with_text = sum(1 for txt in page_texts if _has_meaningful_native_text(txt))
-    required_pages = max(1, math.ceil(page_count * 0.3))
+    required_pages = max(1, math.ceil(page_count * _NATIVE_TEXT_MIN_PAGE_RATIO))
     return PdfInspection(
         page_count=page_count,
         page_texts=page_texts,
@@ -117,6 +118,54 @@ class OriginalPageStore:
     def __init__(self, cache_dir: Path) -> None:
         self._root = cache_dir / "original_pages"
 
+    def _load_existing_prepared_page(
+        self,
+        doc_ref: SourceDocumentRef,
+        target: Path,
+        *,
+        page_index: int,
+        dpi: int | None,
+    ) -> PreparedPage | None:
+        if not target.is_file():
+            return None
+        with Image.open(target) as existing:
+            width, height = existing.size
+        return PreparedPage(
+            document_key=doc_ref.document_key,
+            document_hash=doc_ref.document_hash,
+            page_index=page_index,
+            image_path=target,
+            width=width,
+            height=height,
+            dpi=dpi,
+        )
+
+    def _render_pdf_pixmap(
+        self,
+        doc_ref: SourceDocumentRef,
+        page_index: int,
+        *,
+        dpi: int,
+    ) -> tuple[int, int, bytes, bytes]:
+        if doc_ref.media_type != PDF_MEDIA_TYPE:
+            raise ValueError(
+                f"Expected PDF media_type for {doc_ref.document_key}, got {doc_ref.media_type!r}"
+            )
+        if page_index < 0:
+            raise ValueError(f"page_index must be >= 0, got {page_index}")
+
+        doc = _open_pdf(doc_ref.source_path)
+        try:
+            if page_index >= int(doc.page_count):
+                raise IndexError(
+                    f"page_index {page_index} out of range for PDF with {doc.page_count} pages"
+                )
+            page = doc.load_page(page_index)
+            pix = page.get_pixmap(dpi=dpi, alpha=False)
+            return int(pix.width), int(pix.height), bytes(pix.samples), bytes(pix.tobytes("png"))
+        finally:
+            doc.close()
+
     def preserve_image_document(self, doc_ref: SourceDocumentRef) -> PreparedPage:
         """Correct EXIF orientation and persist full-resolution PNG without mutating source."""
         if doc_ref.media_type not in SUPPORTED_IMAGE_MEDIA_TYPES:
@@ -124,18 +173,9 @@ class OriginalPageStore:
                 f"Unsupported image media_type {doc_ref.media_type!r} for {doc_ref.document_key}"
             )
         target = self._root / doc_ref.document_hash[:16] / "page_0.png"
-        if target.is_file():
-            with Image.open(target) as existing:
-                width, height = existing.size
-            return PreparedPage(
-                document_key=doc_ref.document_key,
-                document_hash=doc_ref.document_hash,
-                page_index=0,
-                image_path=target,
-                width=width,
-                height=height,
-                dpi=None,
-            )
+        existing = self._load_existing_prepared_page(doc_ref, target, page_index=0, dpi=None)
+        if existing is not None:
+            return existing
 
         with Image.open(doc_ref.source_path) as raw_img:
             transposed = ImageOps.exif_transpose(raw_img)
@@ -162,41 +202,16 @@ class OriginalPageStore:
         dpi: int = 300,
     ) -> PreparedPage:
         """Render a single PDF page at high DPI and preserve as lossless PNG on disk."""
-        if doc_ref.media_type != PDF_MEDIA_TYPE:
-            raise ValueError(
-                f"Expected PDF media_type for {doc_ref.document_key}, got {doc_ref.media_type!r}"
-            )
-        if page_index < 0:
-            raise ValueError(f"page_index must be >= 0, got {page_index}")
-
         target = self._root / doc_ref.document_hash[:16] / f"page_{page_index}_dpi{dpi}.png"
-        if target.is_file():
-            with Image.open(target) as existing:
-                width, height = existing.size
-            return PreparedPage(
-                document_key=doc_ref.document_key,
-                document_hash=doc_ref.document_hash,
-                page_index=page_index,
-                image_path=target,
-                width=width,
-                height=height,
-                dpi=dpi,
-            )
+        existing = self._load_existing_prepared_page(
+            doc_ref, target, page_index=page_index, dpi=dpi
+        )
+        if existing is not None:
+            return existing
 
-        doc = _open_pdf(doc_ref.source_path)
-        try:
-            if page_index >= int(doc.page_count):
-                raise IndexError(
-                    f"page_index {page_index} out of range for PDF with {doc.page_count} pages"
-                )
-            page = doc.load_page(page_index)
-            pix = page.get_pixmap(dpi=dpi, alpha=False)
-            width = int(pix.width)
-            height = int(pix.height)
-            png_bytes = bytes(pix.tobytes("png"))
-        finally:
-            doc.close()
-
+        width, height, _samples, png_bytes = self._render_pdf_pixmap(
+            doc_ref, page_index, dpi=dpi
+        )
         _write_png_bytes_atomically(target, png_bytes)
         return PreparedPage(
             document_key=doc_ref.document_key,
@@ -217,31 +232,16 @@ class OriginalPageStore:
         max_edge: int = 1024,
     ) -> EncodedImage:
         """Render a low-resolution PDF page thumbnail in memory for Page Triage."""
-        if doc_ref.media_type != PDF_MEDIA_TYPE:
-            raise ValueError(
-                f"Expected PDF media_type for {doc_ref.document_key}, got {doc_ref.media_type!r}"
-            )
-        doc = _open_pdf(doc_ref.source_path)
-        try:
-            if page_index < 0 or page_index >= int(doc.page_count):
-                raise IndexError(
-                    f"page_index {page_index} out of range for PDF with {doc.page_count} pages"
-                )
-            page = doc.load_page(page_index)
-            pix = page.get_pixmap(dpi=dpi, alpha=False)
-            width = int(pix.width)
-            height = int(pix.height)
-            if max(width, height) > max_edge:
-                img = Image.frombytes("RGB", (width, height), pix.samples)
-                img.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
-                width, height = img.size
-                buf = io.BytesIO()
-                img.save(buf, format="PNG")
-                png_bytes = buf.getvalue()
-            else:
-                png_bytes = bytes(pix.tobytes("png"))
-        finally:
-            doc.close()
+        width, height, samples, png_bytes = self._render_pdf_pixmap(
+            doc_ref, page_index, dpi=dpi
+        )
+        if max(width, height) > max_edge:
+            img = Image.frombytes("RGB", (width, height), samples)
+            img.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
+            width, height = img.size
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            png_bytes = buf.getvalue()
 
         return EncodedImage(
             mime_type="image/png",

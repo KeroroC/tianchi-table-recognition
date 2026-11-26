@@ -19,7 +19,11 @@ from tianchi_table_recognition.models import (
     SourceDocumentRef,
 )
 from tianchi_table_recognition.preprocessing import OriginalPageStore, inspect_pdf
-from tianchi_table_recognition.triage import triage_long_pdf
+from tianchi_table_recognition.triage import (
+    PageIndexEntry,
+    select_candidate_pages,
+    triage_long_pdf,
+)
 
 
 def _pdf_ref(path: Path) -> SourceDocumentRef:
@@ -251,3 +255,27 @@ def test_triage_backward_continuation_pulls_preceding_table_start_page(tmp_path:
 
     assert result.mode == "native_text"
     assert result.candidate_pages == (2, 3)
+
+
+def test_triage_narrative_pages_do_not_hijack_table_candidate_selection() -> None:
+    entries = [
+        PageIndexEntry(page_index=0, summary="2024年度公司经营总结", has_table=False),
+        PageIndexEntry(page_index=1, summary="普通说明页", has_table=False),
+        PageIndexEntry(
+            page_index=2,
+            summary="财务数据表",
+            table_titles=("财务摘要",),
+            has_table=True,
+        ),
+    ]
+    question = Question(
+        id="q_nar",
+        document_key="doc_0123456789abcdef",
+        question_type=QuestionType.EXTRACT,
+        question="2024年公司营收是多少？",
+        table_hint=None,
+        answer_format=AnswerFormat.NUMBER,
+    )
+
+    candidate_pages, _ = select_candidate_pages(entries, [question])
+    assert candidate_pages == (2,)

@@ -6,14 +6,15 @@ import hashlib
 import json
 import re
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from tianchi_table_recognition.gateway import ComplianceError, ModelGateway
 from tianchi_table_recognition.io_utils import atomic_write_text
-from tianchi_table_recognition.models import ModelRole, Question, SourceDocumentRef
+from tianchi_table_recognition.models import ModelRole, Question, SourceDocumentRef, TriageMode
 from tianchi_table_recognition.preprocessing import OriginalPageStore, PdfInspection
 from tianchi_table_recognition.text_matching import (
     extract_search_tokens,
@@ -21,6 +22,7 @@ from tianchi_table_recognition.text_matching import (
     has_forward_continuation_marker,
     normalize_base_title,
     normalize_text_for_match,
+    strip_json_fences,
     token_overlap_score,
 )
 
@@ -37,7 +39,6 @@ DEFAULT_TRIAGE_USER_PROMPT = (
     "'has_table' (bool), 'continues_from_previous' (bool), 'continues_to_next' (bool)."
 )
 
-_CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```$", re.DOTALL | re.IGNORECASE)
 _TITLE_CUE_RE = re.compile(r"(表|续|table|schedule|statement)", re.IGNORECASE)
 _TABLE_TEXT_CUE_RE = re.compile(r"(\d|合计|总计|小计|项目|金额|\||\t)")
 _WHITESPACE_RUN_RE = re.compile(r"\s+")
@@ -71,10 +72,49 @@ class TriageResult(BaseModel):
 
     document_key: str
     page_count: int = Field(ge=1)
-    mode: Literal["short_document", "native_text", "vision_triage"]
+    mode: TriageMode
     entries: tuple[PageIndexEntry, ...] = ()
     candidate_pages: tuple[int, ...]
     per_question_pages: dict[str, tuple[int, ...]] = Field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class TriageCacheKey:
+    """Deterministic cache key isolating vision_triage index caches."""
+
+    document_hash: str
+    stage: str
+    stage_version: str
+    model_id: str
+    prompt_hash: str
+    thumbnail_dpi: int
+
+    def digest(self) -> str:
+        """Compute deterministic SHA-256 hex digest of all triage cache key components."""
+        material = json.dumps(
+            {
+                "document_hash": self.document_hash,
+                "stage": self.stage,
+                "stage_version": self.stage_version,
+                "model_id": self.model_id,
+                "prompt_hash": self.prompt_hash,
+                "thumbnail_dpi": self.thumbnail_dpi,
+            },
+            sort_keys=True,
+        )
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+
+    def matches(self, payload: _TriageIndexCachePayload, page_count: int) -> bool:
+        """Return True if cached triage payload matches every key component and page count."""
+        return (
+            payload.document_hash == self.document_hash
+            and payload.stage == self.stage
+            and payload.stage_version == self.stage_version
+            and payload.model_id == self.model_id
+            and payload.prompt_hash == self.prompt_hash
+            and payload.thumbnail_dpi == self.thumbnail_dpi
+            and len(payload.entries) == page_count
+        )
 
 
 class _TriageIndexCachePayload(BaseModel):
@@ -118,19 +158,11 @@ def _build_native_text_entries(page_texts: Sequence[str]) -> tuple[PageIndexEntr
     return tuple(entries)
 
 
-def _strip_json_fences(raw_text: str) -> str:
-    stripped = raw_text.strip()
-    match = _CODE_FENCE_RE.match(stripped)
-    if match:
-        return match.group(1).strip()
-    return stripped
-
-
 def _parse_triage_batch_response(
     raw_content: str,
     expected_indices: Sequence[int],
 ) -> list[PageIndexEntry]:
-    cleaned = _strip_json_fences(raw_content)
+    cleaned = strip_json_fences(raw_content)
     try:
         parsed: Any = json.loads(cleaned)
     except Exception as exc:
@@ -155,27 +187,8 @@ def _parse_triage_batch_response(
     ]
 
 
-def _triage_cache_path(
-    cache_dir: Path,
-    *,
-    document_hash: str,
-    model_id: str,
-    prompt_hash: str,
-    thumbnail_dpi: int,
-) -> Path:
-    material = json.dumps(
-        {
-            "document_hash": document_hash,
-            "stage": _TRIAGE_STAGE_NAME,
-            "stage_version": _TRIAGE_STAGE_VERSION,
-            "model_id": model_id,
-            "prompt_hash": prompt_hash,
-            "thumbnail_dpi": thumbnail_dpi,
-        },
-        sort_keys=True,
-    )
-    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
-    return cache_dir / "triage_index" / f"{document_hash[:16]}_{digest}.json"
+def _triage_cache_path(cache_dir: Path, key: TriageCacheKey) -> Path:
+    return cache_dir / "triage_index" / f"{key.document_hash[:16]}_{key.digest()}.json"
 
 
 def _build_vision_triage_entries(
@@ -191,27 +204,23 @@ def _build_vision_triage_entries(
     model_id = gateway.model_for_role(ModelRole.VISION_TRIAGE)
     prompt_material = f"{DEFAULT_TRIAGE_SYSTEM_PROMPT}\n---\n{DEFAULT_TRIAGE_USER_PROMPT}"
     prompt_hash = hashlib.sha256(prompt_material.encode("utf-8")).hexdigest()[:16]
+    cache_key = TriageCacheKey(
+        document_hash=doc_ref.document_hash,
+        stage=_TRIAGE_STAGE_NAME,
+        stage_version=_TRIAGE_STAGE_VERSION,
+        model_id=model_id,
+        prompt_hash=prompt_hash,
+        thumbnail_dpi=thumbnail_dpi,
+    )
 
     cache_path: Path | None = None
     if cache_dir is not None:
-        cache_path = _triage_cache_path(
-            cache_dir,
-            document_hash=doc_ref.document_hash,
-            model_id=model_id,
-            prompt_hash=prompt_hash,
-            thumbnail_dpi=thumbnail_dpi,
-        )
+        cache_path = _triage_cache_path(cache_dir, cache_key)
         if cache_path.is_file():
             cached = _TriageIndexCachePayload.model_validate_json(
                 cache_path.read_text(encoding="utf-8")
             )
-            if (
-                cached.document_hash == doc_ref.document_hash
-                and cached.model_id == model_id
-                and cached.prompt_hash == prompt_hash
-                and cached.thumbnail_dpi == thumbnail_dpi
-                and len(cached.entries) == page_count
-            ):
+            if cache_key.matches(cached, page_count):
                 return cached.entries
 
     all_entries: list[PageIndexEntry] = []
@@ -346,12 +355,15 @@ def select_candidate_pages(
             return table_pages, {}
         return tuple(e.page_index for e in entries), {}
 
+    table_entries = [e for e in entries if e.has_table]
+    candidate_pool = table_entries if table_entries else list(entries)
+
     per_question: dict[str, tuple[int, ...]] = {}
     union_pages: set[int] = set()
 
     for question in questions:
         scored = sorted(
-            ((_score_entry_for_question(e, question), e.page_index) for e in entries),
+            ((_score_entry_for_question(e, question), e.page_index) for e in candidate_pool),
             key=lambda item: (-item[0], item[1]),
         )
         max_score = scored[0][0]
@@ -359,9 +371,10 @@ def select_candidate_pages(
             seeds = [
                 idx for score, idx in scored if score >= max_score * 0.6 and score > 0.0
             ][:2]
+        elif table_entries:
+            seeds = [e.page_index for e in table_entries[:3]]
         else:
-            table_seeds = [e.page_index for e in entries if e.has_table][:3]
-            seeds = table_seeds if table_seeds else [entries[0].page_index]
+            seeds = [entries[0].page_index]
 
         selected: set[int] = set(seeds)
         for seed in seeds:
@@ -407,10 +420,10 @@ def triage_long_pdf(
 ) -> TriageResult:
     """Run Page Triage on a long PDF via native text index or vision_triage fallback."""
     if inspection.has_native_text_layer:
-        mode: Literal["native_text", "vision_triage"] = "native_text"
+        mode = TriageMode.NATIVE_TEXT
         entries = _build_native_text_entries(inspection.page_texts)
     else:
-        mode = "vision_triage"
+        mode = TriageMode.VISION_TRIAGE
         entries = _build_vision_triage_entries(
             doc_ref=doc_ref,
             page_count=inspection.page_count,

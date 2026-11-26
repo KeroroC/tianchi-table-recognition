@@ -378,3 +378,37 @@ def test_stage1_extract_document_long_native_and_scanned_pdfs_only_extract_candi
     extract_reqs = [r for r in transport.requests if r.model_role == ModelRole.VISION_EXTRACT]
     assert all((r.images[0].width, r.images[0].height) == (1200, 600) for r in extract_reqs)
     transport.assert_no_filename_leak(["long_native.pdf", "long_scanned.pdf"])
+
+
+def test_stage1_pdf_cache_invalidates_when_render_dpi_changes(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    create_synthetic_text_pdf(
+        docs_dir / "dpi_test.pdf",
+        ["第一页 收入表\n金额 100"],
+        width_pt=288.0,
+        height_pt=144.0,
+    )
+    q_path = write_questions_workbook(
+        tmp_path / "tests.xlsx",
+        [SyntheticQuestionRow("1", "dpi_test.pdf", "extract", "金额?", "收入表", "number")],
+    )
+    doc_ref = next(iter(load_dataset(q_path, docs_dir).documents.values()))
+    transport = FakeModelTransport(
+        role_responses={ModelRole.VISION_EXTRACT: _sample_extraction_json()}
+    )
+    cfg = load_config(env={"TTR_WORK_DIR": str(tmp_path / "work")})
+    gateway = ModelGateway(
+        config=cfg,
+        transport=transport,
+        run_id="r_dpi",
+        ledger_path=tmp_path / "work" / "runs" / "r_dpi" / "audit.jsonl",
+    )
+    cache = PageArtifactCache(tmp_path / "work" / "cache")
+
+    res_300 = extract_document(doc_ref=doc_ref, gateway=gateway, cache=cache, pdf_render_dpi=300)
+    assert res_300.artifacts[0].render_dpi == 300
+    assert transport.count_calls(ModelRole.VISION_EXTRACT) == 1
+
+    res_200 = extract_document(doc_ref=doc_ref, gateway=gateway, cache=cache, pdf_render_dpi=200)
+    assert res_200.artifacts[0].render_dpi == 200
+    assert transport.count_calls(ModelRole.VISION_EXTRACT) == 2

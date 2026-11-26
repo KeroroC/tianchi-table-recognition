@@ -35,6 +35,15 @@ class ModelRole(StrEnum):
     TEXT_REASON = "text_reason"
 
 
+class TriageMode(StrEnum):
+    """Stage 1 document triage/extraction mode."""
+
+    SINGLE_IMAGE = "single_image"
+    SHORT_DOCUMENT = "short_document"
+    NATIVE_TEXT = "native_text"
+    VISION_TRIAGE = "vision_triage"
+
+
 class Question(BaseModel):
     """Single evaluation item stripped of original Source Document filenames."""
 
@@ -115,6 +124,7 @@ class PageArtifact(BaseModel):
     stage_version: str
     model_id: str
     prompt_hash: str
+    render_dpi: int | None = None
 
 
 class QuestionResult(BaseModel):

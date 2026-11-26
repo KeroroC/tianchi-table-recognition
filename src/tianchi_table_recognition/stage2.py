@@ -44,7 +44,7 @@ class ExtractSolver:
     def solve(
         self,
         question: Question,
-        artifact: PageArtifact | Sequence[PageArtifact],
+        artifacts: PageArtifact | Sequence[PageArtifact],
     ) -> QuestionResult:
         """Solve a single extract Question using located page-atomic PageArtifacts."""
         if question.question_type != QuestionType.EXTRACT:
@@ -60,8 +60,8 @@ class ExtractSolver:
                 ),
             )
 
-        artifacts = [artifact] if isinstance(artifact, PageArtifact) else list(artifact)
-        located = self._locator.locate(question, artifacts)
+        artifact_list = [artifacts] if isinstance(artifacts, PageArtifact) else list(artifacts)
+        located = self._locator.locate(question, artifact_list)
         page_context = "\n".join(
             f"[page {page.page_index}] {page.page_context_text}"
             for page in located.pages

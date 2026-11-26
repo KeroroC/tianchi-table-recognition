@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -20,6 +19,7 @@ from tianchi_table_recognition.models import (
     Question,
     SourceDocumentRef,
     TableGrid,
+    TriageMode,
 )
 from tianchi_table_recognition.preprocessing import (
     PDF_MEDIA_TYPE,
@@ -29,6 +29,7 @@ from tianchi_table_recognition.preprocessing import (
     encode_prepared_page,
     inspect_pdf,
 )
+from tianchi_table_recognition.text_matching import strip_json_fences
 from tianchi_table_recognition.triage import triage_long_pdf
 
 DEFAULT_STAGE1_SYSTEM_PROMPT = (
@@ -44,9 +45,6 @@ DEFAULT_STAGE1_USER_PROMPT = (
     "If any cell text is blurry or illegible, set 'text' to null and 'uncertain' to true; "
     "never guess."
 )
-
-_CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```$", re.DOTALL | re.IGNORECASE)
-
 
 class Stage1ExtractionError(RuntimeError):
     """Raised when Stage 1 extraction output cannot be parsed into a PageArtifact."""
@@ -67,6 +65,7 @@ class CacheKey:
     model_id: str
     prompt_hash: str
     page_index: int = 0
+    render_dpi: int | None = None
 
     def digest(self) -> str:
         """Compute deterministic SHA-256 hex digest of all key components."""
@@ -78,6 +77,7 @@ class CacheKey:
                 "model_id": self.model_id,
                 "prompt_hash": self.prompt_hash,
                 "page_index": self.page_index,
+                "render_dpi": self.render_dpi,
             },
             sort_keys=True,
         )
@@ -93,6 +93,7 @@ class CacheKey:
             and artifact.model_id == self.model_id
             and artifact.prompt_hash == self.prompt_hash
             and artifact.page_index == self.page_index
+            and artifact.render_dpi == self.render_dpi
         )
 
 
@@ -144,15 +145,8 @@ class PageExtractor(Protocol):
         document_hash: str,
         image: EncodedImage,
         page_index: int = 0,
+        render_dpi: int | None = None,
     ) -> PageArtifact: ...
-
-
-def _strip_json_fences(raw_text: str) -> str:
-    stripped = raw_text.strip()
-    match = _CODE_FENCE_RE.match(stripped)
-    if match:
-        return match.group(1).strip()
-    return stripped
 
 
 class VisionPageExtractor:
@@ -196,6 +190,7 @@ class VisionPageExtractor:
         document_hash: str,
         image: EncodedImage,
         page_index: int = 0,
+        render_dpi: int | None = None,
     ) -> PageArtifact:
         """Invoke VISION_EXTRACT for a single page image and parse a PageArtifact."""
         model_id = self._gateway.model_for_role(ModelRole.VISION_EXTRACT)
@@ -211,7 +206,7 @@ class VisionPageExtractor:
             stage=self.STAGE_NAME,
             document_key=document_key,
         )
-        cleaned = _strip_json_fences(response.content)
+        cleaned = strip_json_fences(response.content)
         try:
             payload = _RawPagePayload.model_validate_json(cleaned)
         except Exception as exc:
@@ -229,6 +224,7 @@ class VisionPageExtractor:
             stage_version=self.STAGE_VERSION,
             model_id=model_id,
             prompt_hash=self._prompt_hash,
+            render_dpi=render_dpi,
         )
 
 
@@ -239,7 +235,7 @@ class DocumentExtractionResult(BaseModel):
 
     document_key: str
     page_count: int = Field(ge=1)
-    triage_mode: Literal["single_image", "short_document", "native_text", "vision_triage"]
+    triage_mode: TriageMode
     artifacts: tuple[PageArtifact, ...]
     preserved_pages: tuple[PreparedPage, ...]
     candidate_pages: tuple[int, ...]
@@ -260,6 +256,7 @@ def _extract_or_load_page(
         model_id=model_id,
         prompt_hash=extractor.prompt_hash,
         page_index=prepared.page_index,
+        render_dpi=prepared.dpi,
     )
     cached = cache.get(key)
     if cached is not None:
@@ -271,6 +268,7 @@ def _extract_or_load_page(
         document_hash=doc_ref.document_hash,
         image=encoded,
         page_index=prepared.page_index,
+        render_dpi=prepared.dpi,
     )
     cache.put(key, artifact)
     return artifact
@@ -305,7 +303,7 @@ def extract_document(
         return DocumentExtractionResult(
             document_key=doc_ref.document_key,
             page_count=1,
-            triage_mode="single_image",
+            triage_mode=TriageMode.SINGLE_IMAGE,
             artifacts=(artifact,),
             preserved_pages=(prepared,),
             candidate_pages=(0,),
@@ -319,7 +317,7 @@ def extract_document(
 
     inspection = inspect_pdf(doc_ref.source_path)
     if inspection.page_count <= pdf_triage_page_threshold:
-        triage_mode: Literal["short_document", "native_text", "vision_triage"] = "short_document"
+        triage_mode = TriageMode.SHORT_DOCUMENT
         selected_pages = tuple(range(inspection.page_count))
     else:
         triage = triage_long_pdf(

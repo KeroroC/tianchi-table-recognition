@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import io
 from pathlib import Path
+from typing import Any, cast
 
+import pymupdf
 import pytest
 from PIL import Image
 
@@ -135,3 +138,27 @@ def test_inspect_pdf_distinguishes_native_text_and_scanned_pdfs(tmp_path: Path) 
     page_num_info = inspect_pdf(page_num_only_pdf)
     assert page_num_info.page_count == 3
     assert page_num_info.has_native_text_layer is False
+
+
+def test_inspect_pdf_classifies_hybrid_pdf_with_mostly_scanned_pages_as_scanned(
+    tmp_path: Path,
+) -> None:
+    hybrid_path = tmp_path / "hybrid.pdf"
+    doc: Any = cast(Any, pymupdf).open()
+    try:
+        for i in range(3):
+            page = doc.new_page(width=288.0, height=144.0)
+            page.insert_text((16.0, 24.0), f"第{i}页 目录说明", fontname="china-s", fontsize=10)
+        for _ in range(7):
+            img = Image.new("RGB", (200, 100), color=(255, 255, 255))
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            page = doc.new_page(width=288.0, height=144.0)
+            page.insert_image(page.rect, stream=buf.getvalue())
+        doc.save(hybrid_path)
+    finally:
+        doc.close()
+
+    info = inspect_pdf(hybrid_path)
+    assert info.page_count == 10
+    assert info.has_native_text_layer is False
