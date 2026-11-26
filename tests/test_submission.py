@@ -135,3 +135,55 @@ def test_excel_at_text_protection_preserves_leading_zeros_dates_long_numbers_and
             assert ans_cell.number_format == "@"
     finally:
         wb.close()
+
+
+def test_strict_gate_rejects_invalid_json_type_mismatch_and_invalid_format_answers(
+    tmp_path: Path,
+) -> None:
+    template_ids = ["001", "002", "003", "004", "005"]
+    results = {
+        "001": QuestionResult(
+            question_id="001",
+            document_key="doc_test",
+            question_type=QuestionType.EXTRACT,
+            answer_format=AnswerFormat.JSON,
+            status="ok",
+            answer='{"a": 1,}',
+        ),
+        "002": QuestionResult(
+            question_id="002",
+            document_key="doc_test",
+            question_type=QuestionType.EXTRACT,
+            answer_format=AnswerFormat.JSON_ARRAY,
+            status="ok",
+            answer='{"a":1}',
+        ),
+        "003": QuestionResult(
+            question_id="003",
+            document_key="doc_test",
+            question_type=QuestionType.EXTRACT,
+            answer_format=AnswerFormat.NUMBER,
+            status="ok",
+            answer="not-a-number",
+        ),
+        "004": QuestionResult(
+            question_id="004",
+            document_key="doc_test",
+            question_type=QuestionType.EXTRACT,
+            answer_format=AnswerFormat.STRING,
+            status="ok",
+            answer="【错配]",
+        ),
+        "005": _ok_result("005", "00123"),
+    }
+    out_path = tmp_path / "submission.xlsx"
+
+    with pytest.raises(SubmissionGateError) as exc_info:
+        export_submission(template_ids, results, out_path, allow_partial=False)
+
+    err = exc_info.value
+    assert err.missing_ids == []
+    assert err.failed_ids == ["001", "002", "003", "004"]
+    for qid in ("001", "002", "003", "004"):
+        assert qid in str(err)
+    assert not out_path.exists()

@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict
 
 from tianchi_table_recognition.io_utils import atomic_write_file
 from tianchi_table_recognition.models import QuestionResult
+from tianchi_table_recognition.validator import validate_submission_answer
 
 
 class SubmissionGateError(ValueError):
@@ -73,7 +74,13 @@ def export_submission(
         if result.status != "ok" or result.answer is None:
             failed_ids.append(qid)
             continue
-        rows_to_write.append((qid, str(result.answer)))
+        answer_str = str(result.answer)
+        if result.validation_errors or validate_submission_answer(
+            result.answer_format, answer_str
+        ):
+            failed_ids.append(qid)
+            continue
+        rows_to_write.append((qid, answer_str))
 
     if not allow_partial and (missing_ids or failed_ids):
         raise SubmissionGateError(missing_ids=missing_ids, failed_ids=failed_ids)

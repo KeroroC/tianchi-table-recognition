@@ -22,6 +22,7 @@ from tianchi_table_recognition.stage1 import (
 )
 from tianchi_table_recognition.stage2 import ExtractSolver
 from tianchi_table_recognition.submission import SubmissionExportResult, export_submission
+from tianchi_table_recognition.validator import AnswerValidator
 
 _RESULTS_ADAPTER = TypeAdapter(dict[str, QuestionResult])
 
@@ -115,7 +116,8 @@ def run_pipeline(
     )
     cache = PageArtifactCache(config.work_dir / "cache")
     extractor = VisionPageExtractor(gateway=gateway)
-    solver = ExtractSolver(gateway=gateway)
+    validator = AnswerValidator(gateway=gateway)
+    solver = ExtractSolver(gateway=gateway, validator=validator)
 
     artifacts_by_doc: dict[str, PageArtifact] = {}
     stage1_errors: dict[str, str] = {}

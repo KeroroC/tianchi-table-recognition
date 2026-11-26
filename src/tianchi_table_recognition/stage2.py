@@ -12,6 +12,7 @@ from tianchi_table_recognition.models import (
     QuestionResult,
     QuestionType,
 )
+from tianchi_table_recognition.validator import AnswerValidator
 
 DEFAULT_EXTRACT_SYSTEM_PROMPT = (
     "You are an accurate table QA assistant. Answer strictly from the provided "
@@ -30,9 +31,11 @@ class ExtractSolver:
         gateway: ModelGateway,
         *,
         system_prompt: str = DEFAULT_EXTRACT_SYSTEM_PROMPT,
+        validator: AnswerValidator | None = None,
     ) -> None:
         self._gateway = gateway
         self._system_prompt = system_prompt
+        self._validator = validator or AnswerValidator(gateway=gateway)
 
     def solve(self, question: Question, artifact: PageArtifact) -> QuestionResult:
         """Solve a single extract Question using its anonymized PageArtifact."""
@@ -70,14 +73,33 @@ class ExtractSolver:
                 document_key=question.document_key,
                 question_id=question.id,
             )
-            answer = response.content.strip()
+            validation = self._validator.validate(
+                question,
+                response.content,
+                artifact=artifact,
+            )
+            if validation.is_valid and validation.answer is not None:
+                return QuestionResult(
+                    question_id=question.id,
+                    document_key=question.document_key,
+                    question_type=question.question_type,
+                    answer_format=question.answer_format,
+                    status="ok",
+                    answer=validation.answer,
+                    raw_answer=response.content,
+                    json_repaired=validation.repaired,
+                )
             return QuestionResult(
                 question_id=question.id,
                 document_key=question.document_key,
                 question_type=question.question_type,
                 answer_format=question.answer_format,
-                status="ok",
-                answer=answer,
+                status="failed",
+                answer=None,
+                error="; ".join(validation.errors) or "Answer validation failed",
+                raw_answer=response.content,
+                validation_errors=validation.errors,
+                json_repaired=validation.repaired,
             )
         except ComplianceError:
             raise

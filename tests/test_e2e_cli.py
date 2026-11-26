@@ -17,6 +17,7 @@ from tests.fixtures_factory import (
     write_submission_template,
 )
 from tianchi_table_recognition.cli import main
+from tianchi_table_recognition.gateway import TransportRequest, TransportResponse
 from tianchi_table_recognition.models import ModelRole
 
 
@@ -302,3 +303,300 @@ def test_gitignore_blocks_secrets_caches_runs_and_submissions() -> None:
     assert res.returncode == 0
     matched = set(res.stdout.splitlines())
     assert set(ignored_paths) == matched
+
+
+def test_e2e_cli_validator_normalizes_all_four_formats_and_repairs_broken_json(
+    tmp_path: Path,
+) -> None:
+    dataset_dir = tmp_path / "ds_t2"
+    docs_dir = dataset_dir / "docs"
+    forbidden = ["private_financial_report_t2.png"]
+    create_synthetic_image(docs_dir / forbidden[0], label="FIN-T2")
+
+    rows = [
+        SyntheticQuestionRow(
+            id="001",
+            file_name=forbidden[0],
+            question_type="extract",
+            question="公告标题是什么？",
+            table_hint="公告",
+            answer_format="string",
+        ),
+        SyntheticQuestionRow(
+            id="002",
+            file_name=forbidden[0],
+            question_type="extract",
+            question="营业总收入是多少？",
+            table_hint="财务",
+            answer_format="number",
+        ),
+        SyntheticQuestionRow(
+            id="003",
+            file_name=forbidden[0],
+            question_type="extract",
+            question="同比增长率是多少？",
+            table_hint="财务",
+            answer_format="number",
+        ),
+        SyntheticQuestionRow(
+            id="004",
+            file_name=forbidden[0],
+            question_type="extract",
+            question="城市信息JSON",
+            table_hint="地区",
+            answer_format="json",
+        ),
+        SyntheticQuestionRow(
+            id="005",
+            file_name=forbidden[0],
+            question_type="extract",
+            question="明细数组JSON",
+            table_hint="明细",
+            answer_format="json_array",
+        ),
+    ]
+    write_questions_workbook(dataset_dir / "tests.xlsx", rows)
+    write_submission_template(
+        dataset_dir / "submission_template.xlsx",
+        ["001", "002", "003", "004", "005"],
+    )
+
+    stage1_payload = json.dumps(
+        {
+            "page_context_text": "【重要提示】公告",
+            "tables": [
+                {
+                    "table_id": "t1",
+                    "title": "财务表",
+                    "row_count": 2,
+                    "col_count": 2,
+                    "header_row_count": 1,
+                    "cells": [
+                        {"row": 0, "col": 0, "text": "公司", "uncertain": False},
+                        {"row": 0, "col": 1, "text": "收入", "uncertain": False},
+                        {
+                            "row": 1,
+                            "col": 0,
+                            "text": "深圳市腾讯计算机系统有限公司",
+                            "uncertain": False,
+                        },
+                        {"row": 1, "col": 1, "text": "1,234.00", "uncertain": False},
+                    ],
+                }
+            ],
+        },
+        ensure_ascii=False,
+    )
+
+    def _handler(req: TransportRequest) -> TransportResponse:
+        if req.model_role == ModelRole.VISION_EXTRACT:
+            return TransportResponse(
+                content=stage1_payload,
+                prompt_tokens=100,
+                completion_tokens=40,
+                total_tokens=140,
+            )
+        if req.stage == "stage2_json_repair":
+            return TransportResponse(
+                content='[{"项":"甲"}]',
+                prompt_tokens=50,
+                completion_tokens=20,
+                total_tokens=70,
+            )
+        answers = {
+            "001": "答案：【重要提示】公告",
+            "002": "1,234.00",
+            "003": "25.0%",
+            "004": '根据表格：\n```json\n{“城市”：“北京”，}\n```',
+            "005": "[{项: 未闭合",
+        }
+        assert req.question_id is not None
+        return TransportResponse(
+            content=answers[req.question_id],
+            prompt_tokens=60,
+            completion_tokens=20,
+            total_tokens=80,
+        )
+
+    work_dir = tmp_path / "work"
+    out_xlsx = work_dir / "submissions" / "t2_submission.xlsx"
+    transport = FakeModelTransport(handler=_handler)
+
+    rc = main(
+        [
+            "run",
+            "--dataset-dir",
+            str(dataset_dir),
+            "--documents-dir",
+            "docs",
+            "--work-dir",
+            str(work_dir),
+            "--run-id",
+            "t2_run",
+            "--output",
+            str(out_xlsx),
+        ],
+        transport=transport,
+    )
+
+    assert rc == 0
+    assert transport.count_calls(ModelRole.VISION_EXTRACT) == 1
+    # 5 extract solves + 1 targeted stage2_json_repair for question 005
+    assert transport.count_calls(ModelRole.TEXT_REASON) == 6
+    repair_reqs = [r for r in transport.requests if r.stage == "stage2_json_repair"]
+    assert len(repair_reqs) == 1
+    assert repair_reqs[0].question_id == "005"
+    transport.assert_no_filename_leak(forbidden)
+
+    results_data = json.loads(
+        (work_dir / "runs" / "t2_run" / "results.json").read_text(encoding="utf-8")
+    )
+    assert results_data["004"]["json_repaired"] is False
+    assert results_data["005"]["json_repaired"] is True
+
+    wb = load_workbook(out_xlsx, data_only=False)
+    try:
+        ws = wb.active
+        assert ws is not None
+        rows_out = [
+            (ws.cell(r, 1).value, ws.cell(r, 2).value, ws.cell(r, 2).number_format)
+            for r in range(1, ws.max_row + 1)
+        ]
+        assert rows_out == [
+            ("id", "answer", "@"),
+            ("001", "【重要提示】公告", "@"),
+            ("002", "1234", "@"),
+            ("003", "25%", "@"),
+            ("004", '{"城市":"北京"}', "@"),
+            ("005", '[{"项":"甲"}]', "@"),
+        ]
+    finally:
+        wb.close()
+
+
+def test_e2e_cli_strict_gate_blocks_validation_failures_and_allows_partial_export(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    dataset_dir = tmp_path / "ds_t2_fail"
+    docs_dir = dataset_dir / "docs"
+    create_synthetic_image(docs_dir / "doc_fail.png", label="FAIL-T2")
+
+    rows = [
+        SyntheticQuestionRow(
+            id="001",
+            file_name="doc_fail.png",
+            question_type="extract",
+            question="代码是多少？",
+            table_hint=None,
+            answer_format="string",
+        ),
+        SyntheticQuestionRow(
+            id="002",
+            file_name="doc_fail.png",
+            question_type="extract",
+            question="明细JSON",
+            table_hint=None,
+            answer_format="json",
+        ),
+        SyntheticQuestionRow(
+            id="003",
+            file_name="doc_fail.png",
+            question_type="extract",
+            question="公司全称是什么？",
+            table_hint=None,
+            answer_format="string",
+        ),
+    ]
+    write_questions_workbook(dataset_dir / "tests.xlsx", rows)
+    write_submission_template(dataset_dir / "submission_template.xlsx", ["001", "002", "003"])
+
+    stage1_payload = json.dumps(
+        {
+            "page_context_text": "",
+            "tables": [
+                {
+                    "table_id": "t1",
+                    "title": "信息",
+                    "row_count": 2,
+                    "col_count": 2,
+                    "header_row_count": 1,
+                    "cells": [
+                        {"row": 0, "col": 0, "text": "代码", "uncertain": False},
+                        {"row": 0, "col": 1, "text": "公司", "uncertain": False},
+                        {"row": 1, "col": 0, "text": "00123", "uncertain": False},
+                        {
+                            "row": 1,
+                            "col": 1,
+                            "text": "深圳市腾讯计算机系统有限公司",
+                            "uncertain": False,
+                        },
+                    ],
+                }
+            ],
+        },
+        ensure_ascii=False,
+    )
+
+    transport = FakeModelTransport(
+        role_responses={ModelRole.VISION_EXTRACT: stage1_payload},
+        question_responses={
+            "001": "00123",
+            "002": "{unfixable broken json",
+            "003": "深圳市 腾讯计算机系统有限公司",
+        },
+    )
+    work_dir = tmp_path / "work"
+    strict_out = work_dir / "submissions" / "strict.xlsx"
+
+    rc_blocked = main(
+        [
+            "run",
+            "--dataset-dir",
+            str(dataset_dir),
+            "--documents-dir",
+            "docs",
+            "--work-dir",
+            str(work_dir),
+            "--run-id",
+            "t2_fail_run",
+            "--output",
+            str(strict_out),
+        ],
+        transport=transport,
+    )
+    assert rc_blocked != 0
+    assert not strict_out.exists()
+    err_text = capsys.readouterr().err
+    assert "002" in err_text and "003" in err_text
+    # At most 1 repair call for question 002 (none for 001/003)
+    assert len([r for r in transport.requests if r.stage == "stage2_json_repair"]) == 1
+
+    rc_partial = main(
+        [
+            "export",
+            "--dataset-dir",
+            str(dataset_dir),
+            "--work-dir",
+            str(work_dir),
+            "--run-id",
+            "t2_fail_run",
+            "--allow-partial",
+            "--output",
+            str(strict_out),
+        ]
+    )
+    assert rc_partial == 0
+    partial_out = work_dir / "submissions" / "strict_partial.xlsx"
+    assert partial_out.exists()
+
+    wb = load_workbook(partial_out, data_only=False)
+    try:
+        ws = wb.active
+        assert ws is not None
+        assert list(ws.iter_rows(values_only=True)) == [
+            ("id", "answer"),
+            ("001", "00123"),
+        ]
+    finally:
+        wb.close()

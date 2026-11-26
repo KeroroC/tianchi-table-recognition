@@ -129,3 +129,6 @@ class QuestionResult(BaseModel):
     status: Literal["ok", "failed"]
     answer: str | None = None
     error: str | None = None
+    raw_answer: str | None = None
+    validation_errors: tuple[str, ...] = ()
+    json_repaired: bool = False
