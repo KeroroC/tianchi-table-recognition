@@ -76,6 +76,18 @@ class CacheKey:
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+    def matches(self, artifact: PageArtifact) -> bool:
+        """Return True if artifact metadata matches every component of this key."""
+        return (
+            artifact.document_hash == self.document_hash
+            and artifact.stage == self.stage
+            and artifact.stage_version == self.stage_version
+            and artifact.model_id == self.model_id
+            and artifact.prompt_hash == self.prompt_hash
+            and artifact.page_index == self.page_index
+        )
+
+
 class PageArtifactCache:
     """Atomic disk cache for page-level Stage 1 PageArtifact objects."""
 
@@ -92,16 +104,7 @@ class PageArtifactCache:
         if not path.is_file():
             return None
         artifact = PageArtifact.model_validate_json(path.read_text(encoding="utf-8"))
-        if (
-            artifact.document_hash != key.document_hash
-            or artifact.stage != key.stage
-            or artifact.stage_version != key.stage_version
-            or artifact.model_id != key.model_id
-            or artifact.prompt_hash != key.prompt_hash
-            or artifact.page_index != key.page_index
-        ):
-            return None
-        return artifact
+        return artifact if key.matches(artifact) else None
 
     def put(self, key: CacheKey, artifact: PageArtifact) -> Path:
         """Atomically persist PageArtifact to disk via temp file + fsync + replace."""

@@ -55,6 +55,18 @@ def test_strict_gate_rejects_missing_or_failed_questions_without_writing_file(
     assert not out_path.exists()
 
 
+def test_strict_gate_prints_all_pending_ids_even_beyond_twenty(tmp_path: Path) -> None:
+    template_ids = [f"{i:03d}" for i in range(1, 26)]
+    out_path = tmp_path / "submission.xlsx"
+
+    with pytest.raises(SubmissionGateError) as exc_info:
+        export_submission(template_ids, {}, out_path, allow_partial=False)
+
+    msg = str(exc_info.value)
+    for qid in template_ids:
+        assert qid in msg
+
+
 def test_allow_partial_writes_partial_tagged_file_in_template_order(tmp_path: Path) -> None:
     template_ids = ["001", "002", "003"]
     results = {

@@ -37,10 +37,7 @@ class CLIOverrides(BaseModel):
     work_dir: Path | None = None
     bailian_base_url: str | None = None
     vision_extract_model: str | None = None
-    vision_verify_model: str | None = None
-    vision_triage_model: str | None = None
     text_reason_model: str | None = None
-    api_key: str | None = None
 
 
 class AppConfig(BaseModel):
@@ -137,7 +134,6 @@ def _apply_cli(
         ("questions_file", cli.questions_file),
         ("submission_template_file", cli.submission_template_file),
         ("documents_dir", cli.documents_dir),
-        ("api_key", cli.api_key),
     ]
     for target_key, val in cli_map:
         if val is not None:
@@ -145,8 +141,6 @@ def _apply_cli(
 
     role_cli_map = {
         ModelRole.VISION_EXTRACT: cli.vision_extract_model,
-        ModelRole.VISION_VERIFY: cli.vision_verify_model,
-        ModelRole.VISION_TRIAGE: cli.vision_triage_model,
         ModelRole.TEXT_REASON: cli.text_reason_model,
     }
     for role, val in role_cli_map.items():

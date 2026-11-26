@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import os
-import tempfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from openpyxl import Workbook
 from pydantic import BaseModel, ConfigDict
 
+from tianchi_table_recognition.io_utils import atomic_write_file
 from tianchi_table_recognition.models import QuestionResult
 
 
@@ -20,11 +19,10 @@ class SubmissionGateError(ValueError):
         self.missing_ids = missing_ids
         self.failed_ids = failed_ids
         retry_ids = missing_ids + [qid for qid in failed_ids if qid not in missing_ids]
-        preview = ", ".join(retry_ids[:20])
-        suffix = f" ... (+{len(retry_ids) - 20} more)" if len(retry_ids) > 20 else ""
+        joined = ", ".join(retry_ids)
         super().__init__(
             f"Submission gate blocked export: {len(missing_ids)} missing, "
-            f"{len(failed_ids)} failed. Pending/retry IDs: [{preview}{suffix}]"
+            f"{len(failed_ids)} failed. Pending/retry IDs: [{joined}]"
         )
 
 
@@ -81,7 +79,6 @@ def export_submission(
         raise SubmissionGateError(missing_ids=missing_ids, failed_ids=failed_ids)
 
     target_path = _with_partial_suffix(output_path) if allow_partial else output_path
-    target_path.parent.mkdir(parents=True, exist_ok=True)
 
     wb = Workbook()
     ws = wb.active
@@ -94,17 +91,8 @@ def export_submission(
         _write_text_cell(ws.cell(row=row_idx, column=1), qid)
         _write_text_cell(ws.cell(row=row_idx, column=2), answer)
 
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=".tmp_sub_", suffix=".xlsx", dir=target_path.parent
-    )
-    os.close(fd)
-    tmp_path = Path(tmp_name)
     try:
-        wb.save(tmp_path)
-        os.replace(tmp_path, target_path)
-    except Exception:
-        tmp_path.unlink(missing_ok=True)
-        raise
+        atomic_write_file(target_path, wb.save, suffix=".xlsx")
     finally:
         wb.close()
 

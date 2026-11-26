@@ -61,21 +61,13 @@ def test_gateway_rejects_non_bailian_endpoint_before_calling_transport(
 def test_gateway_rejects_non_qwen_model_immediately(tmp_path: Path, bad_model: str) -> None:
     cfg = load_config(env={"TTR_MODEL_TEXT_REASON": bad_model})
     transport = FakeModelTransport()
-    gateway = ModelGateway(
-        config=cfg,
-        transport=transport,
-        run_id="run-bad-model",
-        ledger_path=tmp_path / "run-bad-model" / "audit_ledger.jsonl",
-    )
 
     with pytest.raises(ComplianceError, match="qwen"):
-        gateway.invoke(
-            model_role=ModelRole.TEXT_REASON,
-            system_prompt="system",
-            user_prompt="hello",
-            stage="stage2_extract",
-            document_key="doc_1234",
-            question_id="q1",
+        ModelGateway(
+            config=cfg,
+            transport=transport,
+            run_id="run-bad-model",
+            ledger_path=tmp_path / "run-bad-model" / "audit_ledger.jsonl",
         )
 
     assert transport.count_calls() == 0
@@ -84,19 +76,13 @@ def test_gateway_rejects_non_qwen_model_immediately(tmp_path: Path, bad_model: s
 def test_gateway_rejects_empty_cli_model_immediately(tmp_path: Path) -> None:
     cfg = load_config(env={}, cli_overrides=CLIOverrides(text_reason_model=""))
     transport = FakeModelTransport()
-    gateway = ModelGateway(
-        config=cfg,
-        transport=transport,
-        run_id="run-empty-model",
-        ledger_path=tmp_path / "run-empty-model" / "audit_ledger.jsonl",
-    )
 
     with pytest.raises(ComplianceError, match="qwen"):
-        gateway.invoke(
-            model_role=ModelRole.TEXT_REASON,
-            system_prompt="system",
-            user_prompt="hello",
-            stage="stage2_extract",
+        ModelGateway(
+            config=cfg,
+            transport=transport,
+            run_id="run-empty-model",
+            ledger_path=tmp_path / "run-empty-model" / "audit_ledger.jsonl",
         )
 
     assert transport.count_calls() == 0

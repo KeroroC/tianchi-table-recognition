@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from tianchi_table_recognition.gateway import ModelGateway
+from tianchi_table_recognition.gateway import ComplianceError, ModelGateway
 from tianchi_table_recognition.models import (
     ModelRole,
     PageArtifact,
@@ -79,6 +79,8 @@ class ExtractSolver:
                 status="ok",
                 answer=answer,
             )
+        except ComplianceError:
+            raise
         except Exception as exc:
             return QuestionResult(
                 question_id=question.id,

@@ -184,6 +184,8 @@ class ModelGateway:
         self._run_id = run_id
         self._ledger_path = ledger_path
         self._endpoint_host = validate_bailian_url(config.bailian_base_url)
+        for model_id in config.model_roles.values():
+            validate_compliant_qwen_model(model_id)
         self._ledger_path.parent.mkdir(parents=True, exist_ok=True)
 
     @property

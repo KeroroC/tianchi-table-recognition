@@ -252,6 +252,36 @@ def test_e2e_cli_ids_subset_gate_and_allow_partial_and_env_injection(
         wb.close()
 
 
+def test_e2e_cli_fails_fast_on_non_compliant_text_reason_model(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    dataset_dir, _ = _build_synthetic_dataset(tmp_path)
+    work_dir = tmp_path / "work"
+    transport = _make_fake_transport()
+
+    rc = main(
+        [
+            "run",
+            "--dataset-dir",
+            str(dataset_dir),
+            "--documents-dir",
+            "docs",
+            "--work-dir",
+            str(work_dir),
+            "--text-reason-model",
+            "gpt-4o",
+            "--allow-partial",
+        ],
+        transport=transport,
+    )
+
+    assert rc != 0
+    assert transport.count_calls() == 0
+    captured = capsys.readouterr()
+    assert "qwen" in captured.err
+
+
 def test_gitignore_blocks_secrets_caches_runs_and_submissions() -> None:
     ignored_paths = [
         ".env",

@@ -40,6 +40,10 @@ _THINKING_PATTERNS = re.compile(
     r"净增|增幅|降幅|最大|最小|最高|最低|排名|前几|sum|average|ratio|percent)",
     re.IGNORECASE,
 )
+_COUNTING_PATTERNS = re.compile(
+    r"(多少个|几个|多少家|几家|共有多少|一共有|数量是多少)",
+    re.IGNORECASE,
+)
 
 _MEDIA_TYPE_BY_SUFFIX: dict[str, str] = {
     ".png": "image/png",
@@ -92,6 +96,12 @@ def _normalize_question_type(
         reason = (
             f"Unrecognized question_type {raw_question_type!r}; "
             "matched arithmetic/aggregation keywords in question text."
+        )
+    elif answer_format == AnswerFormat.NUMBER and _COUNTING_PATTERNS.search(question_text):
+        normalized = QuestionType.THINKING
+        reason = (
+            f"Unrecognized question_type {raw_question_type!r}; "
+            "matched counting keywords with answer_format='number'."
         )
     else:
         normalized = QuestionType.EXTRACT

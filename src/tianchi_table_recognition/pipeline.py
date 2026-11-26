@@ -40,6 +40,24 @@ class RunSummary(BaseModel):
     submission_result: SubmissionExportResult | None = None
 
 
+def _export_run_submission(
+    config: AppConfig,
+    *,
+    run_id: str,
+    results_by_id: dict[str, QuestionResult],
+    allow_partial: bool,
+    output_path: Path | None,
+) -> SubmissionExportResult:
+    template_ids = load_submission_template(config.submission_template_path)
+    target_out = output_path or (config.work_dir / "submissions" / f"{run_id}.xlsx")
+    return export_submission(
+        template_ids,
+        results_by_id,
+        target_out,
+        allow_partial=allow_partial,
+    )
+
+
 def _generate_run_id() -> str:
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     return f"run_{stamp}_{uuid.uuid4().hex[:6]}"
@@ -137,13 +155,12 @@ def run_pipeline(
 
     submission_result: SubmissionExportResult | None = None
     if export:
-        template_ids = load_submission_template(config.submission_template_path)
-        target_out = output_path or (config.work_dir / "submissions" / f"{active_run_id}.xlsx")
-        submission_result = export_submission(
-            template_ids,
-            results_by_id,
-            target_out,
+        submission_result = _export_run_submission(
+            config,
+            run_id=active_run_id,
+            results_by_id=results_by_id,
             allow_partial=allow_partial,
+            output_path=output_path,
         )
 
     return RunSummary(
@@ -170,11 +187,10 @@ def export_existing_run(
         raise FileNotFoundError(f"Run results not found: {results_path}")
 
     results_by_id = _RESULTS_ADAPTER.validate_json(results_path.read_text(encoding="utf-8"))
-    template_ids = load_submission_template(config.submission_template_path)
-    target_out = output_path or (config.work_dir / "submissions" / f"{run_id}.xlsx")
-    return export_submission(
-        template_ids,
-        results_by_id,
-        target_out,
+    return _export_run_submission(
+        config,
+        run_id=run_id,
+        results_by_id=results_by_id,
         allow_partial=allow_partial,
+        output_path=output_path,
     )

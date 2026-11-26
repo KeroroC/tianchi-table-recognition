@@ -128,6 +128,14 @@ def test_normalizes_dirty_question_type_via_general_rules_without_hardcoding(
                 table_hint=None,
                 answer_format="number",
             ),
+            SyntheticQuestionRow(
+                id="arbitrary_id_102",
+                file_name="doc1.png",
+                question_type="表中共有多少家子公司？",
+                question="表中共有多少家子公司？",
+                table_hint=None,
+                answer_format="number",
+            ),
         ],
     )
 
@@ -137,8 +145,9 @@ def test_normalizes_dirty_question_type_via_general_rules_without_hardcoding(
         QuestionType.EXTRACT,
         QuestionType.STRUCTURE,
         QuestionType.THINKING,
+        QuestionType.THINKING,
     ]
-    assert len(loaded.warnings) == 3
+    assert len(loaded.warnings) == 4
     assert loaded.warnings[0].question_id == "arbitrary_id_99"
     assert loaded.warnings[0].normalized_question_type == QuestionType.EXTRACT
 
