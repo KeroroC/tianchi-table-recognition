@@ -65,6 +65,14 @@ def test_json_and_json_array_deterministic_cleaning_and_type_checks() -> None:
     assert res_dirty.is_valid is True
     assert res_dirty.answer == '{"名称":"示例","数值":12.5}'
 
+    # Valid ASCII strings with inner Chinese quotes alongside outside-string fullwidth colon
+    res_mixed_quotes = validator.validate(
+        _question("j4", AnswerFormat.JSON),
+        '{"说明": "含“引号”文本", "a"：1}',
+    )
+    assert res_mixed_quotes.is_valid is True
+    assert res_mixed_quotes.answer == '{"说明":"含“引号”文本","a":1}'
+
     # Valid json_array with fence + trailing comma
     res_arr = validator.validate(
         _question("a1", AnswerFormat.JSON_ARRAY),
@@ -214,13 +222,21 @@ def test_number_normalization_precision_commas_percent_and_unit_rules() -> None:
         == "1000"
     )
 
-    # Preserve commas when question explicitly asks for thousands separator
+    # Preserve commas when question explicitly asks for thousands separator,
+    # but strip commas when negated
     assert (
         validator.validate(
             _question("num_comma", AnswerFormat.NUMBER, "请计算总额（保留千分位逗号分隔）"),
             "1234567.0",
         ).answer
         == "1,234,567"
+    )
+    assert (
+        validator.validate(
+            _question("num_no_comma", AnswerFormat.NUMBER, "请计算总额（不要千分位逗号）"),
+            "1,234,567.0",
+        ).answer
+        == "1234567"
     )
 
     # Decimal precision directives (Chinese digits, Arabic digits, 0.01, integer)
@@ -292,6 +308,11 @@ def test_number_normalization_precision_commas_percent_and_unit_rules() -> None:
         "1.2亿元",
     )
     assert unit_conflict.is_valid is False
+    paren_unit_conflict = validator.validate(
+        _question("u3b", AnswerFormat.NUMBER, "营业收入（万元）是多少？"),
+        "1.2亿元",
+    )
+    assert paren_unit_conflict.is_valid is False
     currency_conflict = validator.validate(
         _question("u4", AnswerFormat.NUMBER, "净利润是多少（单位：元）？"),
         "$100",
@@ -320,7 +341,7 @@ def _sample_artifact() -> PageArtifact:
                     TableCell(row=0, col=0, text="公司名称"),
                     TableCell(row=0, col=1, text="英文名"),
                     TableCell(row=1, col=0, text="深圳市腾讯计算机系统有限公司"),
-                    TableCell(row=1, col=1, text="Apple Inc."),
+                    TableCell(row=1, col=1, text="Apple  Inc."),
                 ],
             )
         ],
@@ -353,12 +374,12 @@ def test_string_prefix_stripping_bracket_fidelity_and_spurious_spaces() -> None:
         == "[标准括号]与【方头括号】"
     )
 
-    # Mismatched bracket pairs must fail
-    res_mismatch_pair = validator.validate(
-        _question("s_m1", AnswerFormat.STRING),
-        "【错配]",
-    )
-    assert res_mismatch_pair.is_valid is False
+    # Mismatched and unclosed bracket pairs must fail
+    for bad_brackets in ("【错配]", "[标题", "【标题"):
+        assert (
+            validator.validate(_question("s_m1", AnswerFormat.STRING), bad_brackets).is_valid
+            is False
+        )
 
     # Bracket mutation relative to PageArtifact source text must fail
     res_bracket_drift = validator.validate(
@@ -400,8 +421,16 @@ def test_string_prefix_stripping_bracket_fidelity_and_spurious_spaces() -> None:
         res_bad = validator.validate(_question("s_bad", AnswerFormat.STRING), bad_str)
         assert res_bad.is_valid is False
 
-    # Valid English multi-word, datetime, and leading-zero codes pass without artifact
-    for ok_str in ("New York", "Phase 2", "2024-03-01 12:00:00", "00123", "=A1+B1"):
+    # Valid English multi-word, datetime, codes, and words starting with 结果/Result
+    for ok_str in (
+        "New York",
+        "Phase 2",
+        "2024-03-01 12:00:00",
+        "00123",
+        "=A1+B1",
+        "结果分析报告",
+        "ResultSet",
+    ):
         res_ok = validator.validate(_question("s_ok", AnswerFormat.STRING), ok_str)
         assert res_ok.is_valid is True
         assert res_ok.answer == ok_str

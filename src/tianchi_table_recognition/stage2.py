@@ -78,27 +78,19 @@ class ExtractSolver:
                 response.content,
                 artifact=artifact,
             )
-            if validation.is_valid and validation.answer is not None:
-                return QuestionResult(
-                    question_id=question.id,
-                    document_key=question.document_key,
-                    question_type=question.question_type,
-                    answer_format=question.answer_format,
-                    status="ok",
-                    answer=validation.answer,
-                    raw_answer=response.content,
-                    json_repaired=validation.repaired,
-                )
+            is_valid = validation.is_valid and validation.answer is not None
             return QuestionResult(
                 question_id=question.id,
                 document_key=question.document_key,
                 question_type=question.question_type,
                 answer_format=question.answer_format,
-                status="failed",
-                answer=None,
-                error="; ".join(validation.errors) or "Answer validation failed",
+                status="ok" if is_valid else "failed",
+                answer=validation.answer if is_valid else None,
+                error=None
+                if is_valid
+                else ("; ".join(validation.errors) or "Answer validation failed"),
                 raw_answer=response.content,
-                validation_errors=validation.errors,
+                validation_errors=() if is_valid else validation.errors,
                 json_repaired=validation.repaired,
             )
         except ComplianceError:

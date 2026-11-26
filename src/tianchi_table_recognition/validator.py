@@ -6,7 +6,7 @@ import json
 import re
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -19,9 +19,10 @@ _ANY_FENCED_WHOLE_RE = re.compile(r"^```[a-zA-Z0-9_-]*\s*\n?(.*?)\n?```$", re.DO
 _EXPLANATORY_PREFIX_RE = re.compile(
     r"^(?:"
     r"(?:根据(?:上述|提供|该)?(?:表格|图表|材料|上下文|数据|内容)?(?:信息)?[，,]?\s*)?"
-    r"(?:最终答案(?:是|为)?|答案(?:是|为)?|结果(?:是|为)?|提取结果(?:是|为)?|"
-    r"Final\s+Answer|Answer|Result)"
-    r"\s*[:：]?\s*"
+    r"(?:"
+    r"(?:最终答案|答案|结果|提取结果)\s*(?:(?:是|为)\s*[:：]?|[:：])\s*"
+    r"|(?:Final\s+Answer|Answer|Result)\s*[:：]\s*"
+    r")"
     r")",
     re.IGNORECASE,
 )
@@ -94,14 +95,6 @@ _NUMBER_CANDIDATE_RE = re.compile(
 _VALID_COMMA_INT_RE = re.compile(r"^\d{1,3}(?:,\d{3})+$")
 _RMB_UNITS = frozenset({"元", "千元", "万元", "亿元"})
 _USD_UNITS = frozenset({"美元", "万美元", "亿美元"})
-_SMART_DOUBLE_QUOTES = str.maketrans(
-    {
-        "\u201c": '"',  # “
-        "\u201d": '"',  # ”
-        "\u201e": '"',  # „
-        "\u201f": '"',  # ‟
-    }
-)
 _BRACKET_PAIRS: dict[str, str] = {
     "【": "】",
     "[": "]",
@@ -250,30 +243,32 @@ def _strip_trailing_commas(text: str) -> str:
 
 
 def _normalize_smart_quotes_and_punctuation(text: str) -> str:
-    """Replace Chinese/smart double quotes and outside-string fullwidth : / ,."""
-    quoted = text.translate(_SMART_DOUBLE_QUOTES)
+    """Replace outside-string Chinese/smart double quotes and fullwidth : / ,."""
     out: list[str] = []
-    in_string = False
+    in_ascii_string = False
     escaped = False
-    for ch in quoted:
-        if in_string:
+    for ch in text:
+        if in_ascii_string:
             out.append(ch)
             if escaped:
                 escaped = False
             elif ch == "\\":
                 escaped = True
             elif ch == '"':
-                in_string = False
+                in_ascii_string = False
+            continue
+
+        if ch == '"':
+            in_ascii_string = True
+            out.append(ch)
+        elif ch in ("\u201c", "\u201d", "\u201e", "\u201f"):
+            out.append('"')
+        elif ch == "：":
+            out.append(":")
+        elif ch == "，":
+            out.append(",")
         else:
-            if ch == '"':
-                in_string = True
-                out.append(ch)
-            elif ch == "：":
-                out.append(":")
-            elif ch == "，":
-                out.append(",")
-            else:
-                out.append(ch)
+            out.append(ch)
     return "".join(out)
 
 
@@ -311,6 +306,28 @@ def _try_parse_json_candidate(
     return _dump_compact_json(parsed), None
 
 
+def _spans_with_outermost(text: str) -> list[str]:
+    spans = [text]
+    for span in _extract_outermost_json_spans(text):
+        if span not in spans:
+            spans.append(span)
+    return spans
+
+
+def _try_parse_json_candidates(
+    texts: list[str],
+    answer_format: AnswerFormat,
+    last_error: str,
+) -> tuple[str | None, str]:
+    for text in texts:
+        compact, err = _try_parse_json_candidate(text, answer_format)
+        if compact is not None:
+            return compact, ""
+        if err is not None:
+            last_error = err
+    return None, last_error
+
+
 def _deterministic_clean_json(
     raw_text: str, answer_format: AnswerFormat
 ) -> tuple[str | None, str]:
@@ -319,47 +336,31 @@ def _deterministic_clean_json(
     if not base_candidates:
         return None, "Empty JSON answer"
 
-    # Build ordered pass transformations
     last_error = "Invalid JSON syntax"
     for candidate in base_candidates:
-        # Fast path + Pass A: direct parse and outermost span extraction
-        spans = [candidate]
-        for span in _extract_outermost_json_spans(candidate):
-            if span not in spans:
-                spans.append(span)
+        spans = _spans_with_outermost(candidate)
 
         # Pass 1: as-is
-        for text in spans:
-            compact, err = _try_parse_json_candidate(text, answer_format)
-            if compact is not None:
-                return compact, ""
-            if err is not None:
-                last_error = err
+        compact, last_error = _try_parse_json_candidates(spans, answer_format, last_error)
+        if compact is not None:
+            return compact, ""
 
         # Pass 2: trailing commas removed
-        for text in spans:
-            no_trailing = _strip_trailing_commas(text)
-            if no_trailing == text:
-                continue
-            compact, err = _try_parse_json_candidate(no_trailing, answer_format)
-            if compact is not None:
-                return compact, ""
-            if err is not None:
-                last_error = err
+        no_trailing_spans = [
+            cleaned for text in spans if (cleaned := _strip_trailing_commas(text)) != text
+        ]
+        compact, last_error = _try_parse_json_candidates(
+            no_trailing_spans, answer_format, last_error
+        )
+        if compact is not None:
+            return compact, ""
 
-        # Pass 3: smart quotes + fullwidth structural punctuation + trailing commas
+        # Pass 3: outside-string smart quotes + fullwidth punctuation + trailing commas
         normalized_base = _normalize_smart_quotes_and_punctuation(candidate)
-        norm_spans = [normalized_base]
-        for span in _extract_outermost_json_spans(normalized_base):
-            if span not in norm_spans:
-                norm_spans.append(span)
-        for text in norm_spans:
-            cleaned = _strip_trailing_commas(text)
-            compact, err = _try_parse_json_candidate(cleaned, answer_format)
-            if compact is not None:
-                return compact, ""
-            if err is not None:
-                last_error = err
+        norm_spans = [_strip_trailing_commas(t) for t in _spans_with_outermost(normalized_base)]
+        compact, last_error = _try_parse_json_candidates(norm_spans, answer_format, last_error)
+        if compact is not None:
+            return compact, ""
 
     return None, last_error
 
@@ -368,9 +369,17 @@ def _deterministic_clean_json(
 class _NumberDirectives:
     keep_commas: bool
     precision: int | None
-    percent_mode: str | None  # "percent" | "decimal" | None
+    percent_mode: Literal["percent", "decimal"] | None
     keep_unit: bool
     expected_unit: str | None
+
+
+@dataclass(frozen=True)
+class _ParsedNumber:
+    currency: str
+    value: Decimal
+    has_percent: bool
+    unit: str | None
 
 
 def _strip_explanatory_prefix_and_fences(raw_text: str) -> str:
@@ -400,7 +409,12 @@ def _parse_cn_or_ascii_int(token: str) -> int | None:
 
 
 def _extract_number_directives(question_text: str) -> _NumberDirectives:
-    keep_commas = bool(re.search(r"千分位|千位分隔|逗号分隔|保留逗号", question_text))
+    forbid_commas = bool(
+        re.search(r"(?:不要|无需|不保留|去掉|去除|不带)千?分?位?(?:分隔|逗号)", question_text)
+    )
+    keep_commas = (not forbid_commas) and bool(
+        re.search(r"千分位|千位分隔|逗号分隔|保留逗号", question_text)
+    )
 
     precision: int | None = None
     if re.search(r"保留整数|精确到(?:整数|个位)|取整", question_text):
@@ -421,7 +435,7 @@ def _extract_number_directives(question_text: str) -> _NumberDirectives:
             if m_step:
                 precision = len(m_step.group(1)) + 1
 
-    percent_mode: str | None = None
+    percent_mode: Literal["percent", "decimal"] | None = None
     if re.search(r"以\s*%\s*表示|用百分比表示|以百分比表示|百分比表示|百分数表示", question_text):
         percent_mode = "percent"
     elif re.search(r"用小数表示|以小数表示|小数形式表示", question_text):
@@ -433,13 +447,16 @@ def _extract_number_directives(question_text: str) -> _NumberDirectives:
     )
 
     expected_unit: str | None = None
-    m_unit = re.search(rf"单位\s*[：:]\s*({_UNIT_ALT})", question_text)
-    if m_unit:
-        expected_unit = m_unit.group(1)
-    else:
-        m_how = re.search(rf"是多少\s*({_UNIT_ALT})", question_text)
-        if m_how:
-            expected_unit = m_how.group(1)
+    for unit_pat in (
+        rf"单位\s*[：:]\s*({_UNIT_ALT})",
+        rf"以\s*({_UNIT_ALT})\s*为单位",
+        rf"[（(]\s*(?:单位\s*[：:]\s*)?({_UNIT_ALT})\s*[）)]",
+        rf"是多少\s*({_UNIT_ALT})",
+    ):
+        m_unit = re.search(unit_pat, question_text)
+        if m_unit:
+            expected_unit = m_unit.group(1)
+            break
 
     return _NumberDirectives(
         keep_commas=keep_commas,
@@ -491,6 +508,48 @@ def _fail_result(raw_answer: str, message: str) -> ValidationResult:
     )
 
 
+def _parse_number_components(
+    text: str, *, allow_currency: bool
+) -> tuple[_ParsedNumber | None, str | None]:
+    match = _NUMBER_CANDIDATE_RE.fullmatch(text)
+    if match is None:
+        return None, f"Invalid numeric answer {text!r}"
+
+    currency = (match.group("currency") or "").upper()
+    if currency and not allow_currency:
+        return None, f"Invalid normalized number answer {text!r}"
+
+    sign = match.group("sign") or ""
+    digits_raw = match.group("digits")
+    has_percent = match.group("percent") is not None
+    unit = match.group("unit")
+
+    int_part = digits_raw.partition(".")[0]
+    if "," in int_part and not _VALID_COMMA_INT_RE.fullmatch(int_part):
+        return None, f"Malformed thousands comma grouping in {digits_raw!r}"
+
+    if has_percent and unit is not None:
+        return None, f"Ambiguous number with both '%' and unit {unit!r}"
+
+    numeric_str = f"{sign}{digits_raw.replace(',', '')}"
+    try:
+        dec_val = Decimal(numeric_str)
+    except InvalidOperation as exc:
+        return None, f"Invalid Decimal value {numeric_str!r}: {exc}"
+    if not dec_val.is_finite():
+        return None, f"Non-finite number {numeric_str!r} is not allowed"
+
+    return (
+        _ParsedNumber(
+            currency=currency,
+            value=dec_val,
+            has_percent=has_percent,
+            unit=unit,
+        ),
+        None,
+    )
+
+
 def _validate_number(question: Question, raw_answer: str) -> ValidationResult:
     cleaned = _strip_explanatory_prefix_and_fences(raw_answer)
     cleaned = cleaned.translate(_FULLWIDTH_NUM_MAP)
@@ -499,70 +558,49 @@ def _validate_number(question: Question, raw_answer: str) -> ValidationResult:
     if not cleaned:
         return _fail_result(raw_answer, "Empty number answer")
 
-    match = _NUMBER_CANDIDATE_RE.fullmatch(cleaned)
-    if match is None:
-        return _fail_result(raw_answer, f"Invalid numeric answer {cleaned!r}")
-
-    currency = (match.group("currency") or "").upper()
-    sign = match.group("sign") or ""
-    digits_raw = match.group("digits")
-    has_percent = match.group("percent") is not None
-    unit = match.group("unit")
-
-    int_part = digits_raw.partition(".")[0]
-    if "," in int_part and not _VALID_COMMA_INT_RE.fullmatch(int_part):
-        return _fail_result(raw_answer, f"Malformed thousands comma grouping in {digits_raw!r}")
-
-    numeric_str = f"{sign}{digits_raw.replace(',', '')}"
-    try:
-        dec_val = Decimal(numeric_str)
-    except InvalidOperation as exc:
-        return _fail_result(raw_answer, f"Invalid Decimal value {numeric_str!r}: {exc}")
-    if not dec_val.is_finite():
-        return _fail_result(raw_answer, f"Non-finite number {numeric_str!r} is not allowed")
+    parsed, parse_err = _parse_number_components(cleaned, allow_currency=True)
+    if parsed is None:
+        return _fail_result(raw_answer, parse_err or "Invalid numeric answer")
 
     directives = _extract_number_directives(question.question)
 
-    if directives.percent_mode == "percent" and not has_percent:
+    if directives.percent_mode == "percent" and not parsed.has_percent:
         return _fail_result(
             raw_answer,
             "Question requires '%' percentage representation; refusing silent conversion",
         )
-    if directives.percent_mode == "decimal" and has_percent:
+    if directives.percent_mode == "decimal" and parsed.has_percent:
         return _fail_result(
             raw_answer,
             "Question requires decimal representation without '%'; refusing silent conversion",
         )
 
     if directives.expected_unit is not None:
-        if unit is not None and unit != directives.expected_unit:
+        if parsed.unit is not None and parsed.unit != directives.expected_unit:
             return _fail_result(
                 raw_answer,
-                f"Number unit mismatch: got {unit!r}, expected {directives.expected_unit!r}",
+                f"Number unit mismatch: got {parsed.unit!r}, expected {directives.expected_unit!r}",
             )
-        if currency in ("$", "US$", "USD") and directives.expected_unit in _RMB_UNITS:
+        if parsed.currency in ("$", "US$", "USD") and directives.expected_unit in _RMB_UNITS:
             return _fail_result(
                 raw_answer,
-                f"Currency mismatch: got {currency!r} for unit {directives.expected_unit!r}",
+                f"Currency mismatch: got {parsed.currency!r} for unit {directives.expected_unit!r}",
             )
-        if currency in ("¥", "￥", "RMB", "CNY") and directives.expected_unit in _USD_UNITS:
+        if parsed.currency in ("¥", "￥", "RMB", "CNY") and directives.expected_unit in _USD_UNITS:
             return _fail_result(
                 raw_answer,
-                f"Currency mismatch: got {currency!r} for unit {directives.expected_unit!r}",
+                f"Currency mismatch: got {parsed.currency!r} for unit {directives.expected_unit!r}",
             )
-
-    if has_percent and unit is not None:
-        return _fail_result(raw_answer, f"Ambiguous number with both '%' and unit {unit!r}")
 
     formatted = _format_decimal_number(
-        dec_val,
+        parsed.value,
         precision=directives.precision,
         keep_commas=directives.keep_commas,
     )
-    if has_percent:
+    if parsed.has_percent:
         formatted = f"{formatted}%"
     elif directives.keep_unit:
-        chosen_unit = unit or directives.expected_unit
+        chosen_unit = parsed.unit or directives.expected_unit
         if chosen_unit:
             formatted = f"{formatted}{chosen_unit}"
 
@@ -591,16 +629,13 @@ def _check_distinct_bracket_pairs(text: str) -> str | None:
             stack.append(ch)
         elif ch in _BRACKET_CLOSERS:
             if not stack:
-                if ch != "]":
-                    return f"Unmatched closing bracket {ch!r} in string answer"
-                continue
+                return f"Unmatched closing bracket {ch!r} in string answer"
             expected_closer = _BRACKET_PAIRS[stack[-1]]
             if ch != expected_closer:
                 return f"Mismatched bracket pair {stack[-1]!r} and {ch!r} in string answer"
             stack.pop()
-    for unclosed in stack:
-        if unclosed != "[":
-            return f"Unclosed bracket {unclosed!r} in string answer"
+    if stack:
+        return f"Unclosed bracket {stack[-1]!r} in string answer"
     return None
 
 
@@ -645,7 +680,7 @@ def _validate_string(
     if _WHITESPACE_RE.search(cleaned) and not verbatim_in_source:
         if source_texts:
             spaceless = _WHITESPACE_RE.sub("", cleaned)
-            if any(spaceless in _WHITESPACE_RE.sub("", src) for src in source_texts):
+            if any(spaceless in src for src in source_texts):
                 return _fail_result(
                     raw_answer,
                     "Spurious whitespace inserted into spaceless source text",
@@ -673,22 +708,8 @@ def validate_submission_answer(answer_format: AnswerFormat, answer: str) -> tupl
         return (err,) if err is not None else ()
 
     if answer_format == AnswerFormat.NUMBER:
-        match = _NUMBER_CANDIDATE_RE.fullmatch(answer)
-        if match is None or match.group("currency"):
-            return (f"Invalid normalized number answer {answer!r}",)
-        digits_raw = match.group("digits")
-        int_part = digits_raw.partition(".")[0]
-        if "," in int_part and not _VALID_COMMA_INT_RE.fullmatch(int_part):
-            return (f"Malformed thousands comma grouping in {digits_raw!r}",)
-        if match.group("percent") is not None and match.group("unit") is not None:
-            return ("Number answer cannot contain both '%' and a unit",)
-        try:
-            dec = Decimal(f"{match.group('sign') or ''}{digits_raw.replace(',', '')}")
-        except InvalidOperation:
-            return (f"Invalid numeric value {answer!r}",)
-        if not dec.is_finite():
-            return (f"Non-finite number {answer!r}",)
-        return ()
+        _, err = _parse_number_components(answer, allow_currency=False)
+        return (err,) if err is not None else ()
 
     if answer_format == AnswerFormat.STRING:
         if answer != answer.strip() or any(ch in answer for ch in _ZERO_WIDTH_CHARS):
