@@ -38,6 +38,8 @@ class CLIOverrides(BaseModel):
     bailian_base_url: str | None = None
     vision_extract_model: str | None = None
     text_reason_model: str | None = None
+    pdf_render_dpi: int | None = None
+    pdf_triage_page_threshold: int | None = None
 
 
 class AppConfig(BaseModel):
@@ -54,6 +56,9 @@ class AppConfig(BaseModel):
     model_roles: dict[ModelRole, str]
     pricing_cny_per_1k_tokens: dict[str, PricingRate]
     api_key: str | None = None
+    pdf_render_dpi: int = Field(default=300, ge=72)
+    pdf_triage_page_threshold: int = Field(default=8, ge=1)
+    pdf_triage_thumbnail_dpi: int = Field(default=72, ge=36)
 
     def resolve_dataset_path(self, raw_path: Path) -> Path:
         """Resolve a relative dataset path against dataset_dir if configured."""
@@ -121,6 +126,15 @@ def _apply_env(
         if raw := env_map.get(env_key):
             model_roles[role] = raw
 
+    int_keys = {
+        "TTR_PDF_RENDER_DPI": "pdf_render_dpi",
+        "TTR_PDF_TRIAGE_PAGE_THRESHOLD": "pdf_triage_page_threshold",
+        "TTR_PDF_TRIAGE_THUMBNAIL_DPI": "pdf_triage_thumbnail_dpi",
+    }
+    for env_key, target_key in int_keys.items():
+        if raw := env_map.get(env_key):
+            values[target_key] = int(raw)
+
 
 def _apply_cli(
     values: dict[str, Any],
@@ -134,6 +148,8 @@ def _apply_cli(
         ("questions_file", cli.questions_file),
         ("submission_template_file", cli.submission_template_file),
         ("documents_dir", cli.documents_dir),
+        ("pdf_render_dpi", cli.pdf_render_dpi),
+        ("pdf_triage_page_threshold", cli.pdf_triage_page_threshold),
     ]
     for target_key, val in cli_map:
         if val is not None:
@@ -163,6 +179,9 @@ def load_config(
         "questions_file": raw["questions_file"],
         "submission_template_file": raw["submission_template_file"],
         "documents_dir": raw["documents_dir"],
+        "pdf_render_dpi": raw.get("pdf_render_dpi", 300),
+        "pdf_triage_page_threshold": raw.get("pdf_triage_page_threshold", 8),
+        "pdf_triage_thumbnail_dpi": raw.get("pdf_triage_thumbnail_dpi", 72),
         "api_key": None,
     }
 
@@ -193,4 +212,7 @@ def load_config(
         model_roles=model_roles,
         pricing_cny_per_1k_tokens=pricing,
         api_key=str(values["api_key"]) if values["api_key"] else None,
+        pdf_render_dpi=int(values["pdf_render_dpi"]),
+        pdf_triage_page_threshold=int(values["pdf_triage_page_threshold"]),
+        pdf_triage_thumbnail_dpi=int(values["pdf_triage_thumbnail_dpi"]),
     )

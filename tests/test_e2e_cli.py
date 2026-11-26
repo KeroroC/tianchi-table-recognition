@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -13,6 +14,9 @@ from tests.fakes import FakeModelTransport
 from tests.fixtures_factory import (
     SyntheticQuestionRow,
     create_synthetic_image,
+    create_synthetic_image_with_exif,
+    create_synthetic_scanned_pdf,
+    create_synthetic_text_pdf,
     write_questions_workbook,
     write_submission_template,
 )
@@ -600,3 +604,370 @@ def test_e2e_cli_strict_gate_blocks_validation_failures_and_allows_partial_expor
         ]
     finally:
         wb.close()
+
+
+def test_e2e_cli_multiformat_exif_short_pdf_and_long_native_scanned_pdfs(
+    tmp_path: Path,
+) -> None:
+    dataset_dir = tmp_path / "ds_t3"
+    docs_dir = dataset_dir / "docs"
+    forbidden = [
+        "secret_photo_t3.jpg",
+        "secret_scan_t3.webp",
+        "secret_short_3p.pdf",
+        "secret_long_native_10p.pdf",
+        "secret_long_scanned_10p.pdf",
+    ]
+    jpg_path = create_synthetic_image_with_exif(
+        docs_dir / forbidden[0],
+        width=160,
+        height=80,
+        orientation=6,
+        image_format="JPEG",
+        label="JPG-T3",
+    )
+    webp_path = create_synthetic_image_with_exif(
+        docs_dir / forbidden[1],
+        width=200,
+        height=100,
+        orientation=6,
+        image_format="WEBP",
+        label="WEBP-T3",
+    )
+    jpg_bytes_before = jpg_path.read_bytes()
+    webp_bytes_before = webp_path.read_bytes()
+
+    create_synthetic_text_pdf(
+        docs_dir / forbidden[2],
+        [
+            "第一页 公司概览\n成立日期 2020-01-01",
+            "第二页 订单统计表\n区域 数量\n华北 42",
+            "第三页 联系方式\n电话 010-12345678",
+        ],
+        width_pt=288.0,
+        height_pt=144.0,
+    )
+
+    native_long_pages = [f"第{i}页 无关说明文本内容" for i in range(10)]
+    native_long_pages[4] = "第五页 研发费用明细表\n项目 金额\n人员人工 1200"
+    native_long_pages[5] = "研发费用明细表（续）\n折旧摊销 350\n合计 1550"
+    create_synthetic_text_pdf(
+        docs_dir / forbidden[3],
+        native_long_pages,
+        width_pt=288.0,
+        height_pt=144.0,
+    )
+
+    create_synthetic_scanned_pdf(
+        docs_dir / forbidden[4],
+        [f"SCAN-{i}" for i in range(10)],
+        width_pt=288.0,
+        height_pt=144.0,
+    )
+
+    rows = [
+        SyntheticQuestionRow(
+            "001", forbidden[0], "extract", "照片代码是多少？", "照片表", "string"
+        ),
+        SyntheticQuestionRow(
+            "002", forbidden[1], "extract", "WebP编号是多少？", "扫描表", "string"
+        ),
+        SyntheticQuestionRow(
+            "003", forbidden[2], "extract", "订单统计表华北数量是多少？", "订单统计表", "number"
+        ),
+        SyntheticQuestionRow(
+            "004",
+            forbidden[3],
+            "extract",
+            "研发费用明细表中折旧摊销金额是多少？",
+            "研发费用明细表",
+            "number",
+        ),
+        SyntheticQuestionRow(
+            "005",
+            forbidden[4],
+            "extract",
+            "资产负债表负债合计是多少？",
+            "资产负债表",
+            "number",
+        ),
+    ]
+    write_questions_workbook(dataset_dir / "tests.xlsx", rows)
+    write_submission_template(
+        dataset_dir / "submission_template.xlsx",
+        ["001", "002", "003", "004", "005"],
+    )
+
+    def _page_json(page_idx: int, context: str, tables: list[dict[str, object]]) -> str:
+        return json.dumps({"page_context_text": context, "tables": tables}, ensure_ascii=False)
+
+    def _grid_dict(
+        table_id: str,
+        title: str,
+        rows_data: list[list[str]],
+    ) -> dict[str, object]:
+        return {
+            "table_id": table_id,
+            "title": title,
+            "row_count": len(rows_data),
+            "col_count": len(rows_data[0]),
+            "header_row_count": 1,
+            "cells": [
+                {"row": r, "col": c, "text": txt, "uncertain": False}
+                for r, row in enumerate(rows_data)
+                for c, txt in enumerate(row)
+            ],
+        }
+
+    # Pre-compute expected document_keys by inspection? Wait: handler can infer doc by page/image!
+    # Even simpler: map via stage1 prompts or unique page_index / dimensions, or read from run_meta?
+    # Wait: let's track calls per (document_key, page_index) cleanly inside _handler!
+    native_extracted_pages: list[int] = []
+    scanned_extracted_pages: list[int] = []
+
+    def _handler(req: TransportRequest) -> TransportResponse:
+        if req.model_role == ModelRole.VISION_TRIAGE:
+            match = re.search(r"page_indices:\s*(\[[^\]]+\])", req.user_prompt)
+            assert match is not None
+            indices = json.loads(match.group(1))
+            assert all((img.width, img.height) == (288, 144) for img in req.images)
+            pages_out = []
+            for idx in indices:
+                if idx == 6:
+                    pages_out.append(
+                        {
+                            "page_index": 6,
+                            "summary": "资产负债表 资产部分",
+                            "table_titles": ["资产负债表"],
+                            "has_table": True,
+                            "continues_to_next": True,
+                        }
+                    )
+                elif idx == 7:
+                    pages_out.append(
+                        {
+                            "page_index": 7,
+                            "summary": "资产负债表（续） 负债合计",
+                            "table_titles": ["资产负债表（续）"],
+                            "has_table": True,
+                            "continues_from_previous": True,
+                        }
+                    )
+                else:
+                    pages_out.append({"page_index": idx, "summary": "正文说明", "has_table": False})
+            return TransportResponse(
+                content=json.dumps({"pages": pages_out}, ensure_ascii=False),
+                prompt_tokens=60,
+                completion_tokens=30,
+                total_tokens=90,
+            )
+
+        if req.model_role == ModelRole.VISION_EXTRACT:
+            img = req.images[0]
+            if (img.width, img.height) == (80, 160):
+                content = _page_json(
+                    0,
+                    "照片",
+                    [_grid_dict("t_jpg", "照片表", [["键", "值"], ["照片代码", "JPG001"]])],
+                )
+            elif (img.width, img.height) == (100, 200):
+                content = _page_json(
+                    0,
+                    "WebP",
+                    [_grid_dict("t_webp", "扫描表", [["键", "值"], ["WebP编号", "WP002"]])],
+                )
+            else:
+                assert (img.width, img.height) == (1200, 600)
+                m = re.search(r"page_index:\s*(\d+)", req.user_prompt)
+                assert m is not None
+                pidx = int(m.group(1))
+                if pidx in (0, 1, 2):
+                    short_tables = (
+                        [
+                            _grid_dict(
+                                f"t_short_{pidx}",
+                                "订单统计表",
+                                [["区域", "数量"], ["华北", "42"]],
+                            )
+                        ]
+                        if pidx == 1
+                        else []
+                    )
+                    content = _page_json(pidx, f"短PDF第{pidx}页", short_tables)
+                elif pidx == 4:
+                    native_extracted_pages.append(pidx)
+                    content = _page_json(
+                        4,
+                        "第五页 研发费用明细表",
+                        [
+                            _grid_dict(
+                                "t_rd_4",
+                                "研发费用明细表",
+                                [["项目", "金额"], ["人员人工", "1200"]],
+                            )
+                        ],
+                    )
+                elif pidx == 5:
+                    native_extracted_pages.append(pidx)
+                    content = _page_json(
+                        5,
+                        "研发费用明细表（续）",
+                        [
+                            _grid_dict(
+                                "t_rd_5",
+                                "研发费用明细表（续）",
+                                [["项目", "金额"], ["折旧摊销", "350"]],
+                            )
+                        ],
+                    )
+                elif pidx == 6:
+                    scanned_extracted_pages.append(pidx)
+                    content = _page_json(
+                        6,
+                        "资产负债表",
+                        [
+                            _grid_dict(
+                                "t_bs_6",
+                                "资产负债表",
+                                [["科目", "金额"], ["资产合计", "9000"]],
+                            )
+                        ],
+                    )
+                elif pidx == 7:
+                    scanned_extracted_pages.append(pidx)
+                    content = _page_json(
+                        7,
+                        "资产负债表（续）",
+                        [
+                            _grid_dict(
+                                "t_bs_7",
+                                "资产负债表（续）",
+                                [["科目", "金额"], ["负债合计", "4200"]],
+                            )
+                        ],
+                    )
+                else:
+                    raise AssertionError(
+                        f"Unexpected high-res extraction on irrelevant page {pidx}"
+                    )
+            return TransportResponse(
+                content=content,
+                prompt_tokens=100,
+                completion_tokens=40,
+                total_tokens=140,
+            )
+
+        assert req.model_role == ModelRole.TEXT_REASON
+        assert req.question_id is not None
+        if req.question_id in ("004", "005"):
+            assert "CrossPageContinuation: true" in req.user_prompt
+        if req.question_id == "004":
+            assert "t_rd_4" in req.user_prompt and "t_rd_5" in req.user_prompt
+        if req.question_id == "005":
+            assert "t_bs_6" in req.user_prompt and "t_bs_7" in req.user_prompt
+
+        answers = {
+            "001": "JPG001",
+            "002": "WP002",
+            "003": "42",
+            "004": "350",
+            "005": "4200",
+        }
+        return TransportResponse(
+            content=answers[req.question_id],
+            prompt_tokens=60,
+            completion_tokens=20,
+            total_tokens=80,
+        )
+
+    work_dir = tmp_path / "work"
+    out_xlsx = work_dir / "submissions" / "t3_submission.xlsx"
+    transport = FakeModelTransport(handler=_handler)
+
+    rc = main(
+        [
+            "run",
+            "--dataset-dir",
+            str(dataset_dir),
+            "--documents-dir",
+            "docs",
+            "--work-dir",
+            str(work_dir),
+            "--pdf-triage-page-threshold",
+            "8",
+            "--pdf-render-dpi",
+            "300",
+            "--run-id",
+            "t3_run_1",
+            "--output",
+            str(out_xlsx),
+        ],
+        transport=transport,
+    )
+
+    assert rc == 0
+    # 1 JPG + 1 WebP + 3 short PDF pages + 2 native long PDF pages + 2 scanned long PDF pages = 9
+    assert transport.count_calls(ModelRole.VISION_EXTRACT) == 9
+    # Only the 10-page scanned PDF triggers vision_triage (3 batches: 4 + 4 + 2)
+    assert transport.count_calls(ModelRole.VISION_TRIAGE) == 3
+    assert transport.count_calls(ModelRole.TEXT_REASON) == 5
+    assert sorted(native_extracted_pages) == [4, 5]
+    assert sorted(scanned_extracted_pages) == [6, 7]
+
+    # Source images were not mutated
+    assert jpg_path.read_bytes() == jpg_bytes_before
+    assert webp_path.read_bytes() == webp_bytes_before
+
+    # Zero filename leaks in outbound requests or cache files
+    transport.assert_no_filename_leak(forbidden)
+    for cache_file in (work_dir / "cache").rglob("*"):
+        if cache_file.is_file():
+            assert not any(name in str(cache_file) for name in forbidden)
+            if cache_file.suffix == ".json":
+                text = cache_file.read_text(encoding="utf-8")
+                assert not any(name in text for name in forbidden)
+
+    # Verify Excel output
+    wb = load_workbook(out_xlsx, data_only=False)
+    try:
+        ws = wb.active
+        assert ws is not None
+        assert [
+            (ws.cell(r, 1).value, ws.cell(r, 2).value, ws.cell(r, 2).number_format)
+            for r in range(1, ws.max_row + 1)
+        ] == [
+            ("id", "answer", "@"),
+            ("001", "JPG001", "@"),
+            ("002", "WP002", "@"),
+            ("003", "42", "@"),
+            ("004", "350", "@"),
+            ("005", "4200", "@"),
+        ]
+    finally:
+        wb.close()
+
+    # Second run reuses Stage 1 & Triage caches -> 0 new VISION_EXTRACT / VISION_TRIAGE calls
+    rc_2 = main(
+        [
+            "run",
+            "--dataset-dir",
+            str(dataset_dir),
+            "--documents-dir",
+            "docs",
+            "--work-dir",
+            str(work_dir),
+            "--pdf-triage-page-threshold",
+            "8",
+            "--pdf-render-dpi",
+            "300",
+            "--run-id",
+            "t3_run_2",
+            "--output",
+            str(work_dir / "submissions" / "t3_submission_2.xlsx"),
+        ],
+        transport=transport,
+    )
+    assert rc_2 == 0
+    assert transport.count_calls(ModelRole.VISION_EXTRACT) == 9
+    assert transport.count_calls(ModelRole.VISION_TRIAGE) == 3
+    assert transport.count_calls(ModelRole.TEXT_REASON) == 10

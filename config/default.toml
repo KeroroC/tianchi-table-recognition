@@ -4,6 +4,9 @@ dataset_dir = ""
 questions_file = "tests.xlsx"
 submission_template_file = "submission_template.xlsx"
 documents_dir = "."
+pdf_render_dpi = 300
+pdf_triage_page_threshold = 8
+pdf_triage_thumbnail_dpi = 72
 
 [model_roles]
 vision_extract = "qwen-vl-max"

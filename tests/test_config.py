@@ -18,6 +18,9 @@ def test_load_config_reads_repo_defaults() -> None:
     assert cfg.model_roles[ModelRole.TEXT_REASON] == "qwen-max"
     assert cfg.work_dir == Path("work")
     assert cfg.api_key is None
+    assert cfg.pdf_render_dpi == 300
+    assert cfg.pdf_triage_page_threshold == 8
+    assert cfg.pdf_triage_thumbnail_dpi == 72
 
 
 def test_env_overrides_repo_defaults(tmp_path: Path) -> None:
@@ -33,6 +36,9 @@ def test_env_overrides_repo_defaults(tmp_path: Path) -> None:
         "TTR_MODEL_VISION_EXTRACT": "qwen2.5-vl-72b-instruct",
         "TTR_MODEL_TEXT_REASON": "qwen-plus",
         "DASHSCOPE_API_KEY": "sk-test-env-key",
+        "TTR_PDF_RENDER_DPI": "240",
+        "TTR_PDF_TRIAGE_PAGE_THRESHOLD": "12",
+        "TTR_PDF_TRIAGE_THUMBNAIL_DPI": "96",
     }
 
     cfg = load_config(env=env)
@@ -46,6 +52,9 @@ def test_env_overrides_repo_defaults(tmp_path: Path) -> None:
     assert cfg.model_roles[ModelRole.VISION_EXTRACT] == "qwen2.5-vl-72b-instruct"
     assert cfg.model_roles[ModelRole.TEXT_REASON] == "qwen-plus"
     assert cfg.api_key == "sk-test-env-key"
+    assert cfg.pdf_render_dpi == 240
+    assert cfg.pdf_triage_page_threshold == 12
+    assert cfg.pdf_triage_thumbnail_dpi == 96
 
 
 def test_cli_overrides_env_without_clobbering_unset_fields(tmp_path: Path) -> None:
@@ -56,11 +65,15 @@ def test_cli_overrides_env_without_clobbering_unset_fields(tmp_path: Path) -> No
         "TTR_DATASET_DIR": str(env_dataset),
         "TTR_WORK_DIR": str(tmp_path / "env_work"),
         "TTR_MODEL_VISION_EXTRACT": "qwen-vl-plus",
+        "TTR_PDF_RENDER_DPI": "240",
+        "TTR_PDF_TRIAGE_PAGE_THRESHOLD": "10",
     }
     overrides = CLIOverrides(
         work_dir=cli_work,
         questions_file=abs_questions,
         vision_extract_model=None,
+        pdf_render_dpi=300,
+        pdf_triage_page_threshold=5,
     )
 
     cfg = load_config(env=env, cli_overrides=overrides)
@@ -69,3 +82,5 @@ def test_cli_overrides_env_without_clobbering_unset_fields(tmp_path: Path) -> No
     assert cfg.work_dir == cli_work
     assert cfg.questions_path == abs_questions
     assert cfg.model_roles[ModelRole.VISION_EXTRACT] == "qwen-vl-plus"
+    assert cfg.pdf_render_dpi == 300
+    assert cfg.pdf_triage_page_threshold == 5

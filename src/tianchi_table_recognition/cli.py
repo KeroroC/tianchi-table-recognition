@@ -39,6 +39,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--bailian-base-url", type=str, default=None)
     run_parser.add_argument("--vision-extract-model", type=str, default=None)
     run_parser.add_argument("--text-reason-model", type=str, default=None)
+    run_parser.add_argument("--pdf-render-dpi", type=int, default=None)
+    run_parser.add_argument("--pdf-triage-page-threshold", type=int, default=None)
     run_parser.add_argument("--ids", type=str, default=None, help="Comma-separated question IDs")
     run_parser.add_argument("--run-id", type=str, default=None)
     run_parser.add_argument("--output", type=Path, default=None)
@@ -79,6 +81,8 @@ def main(
         bailian_base_url=getattr(args, "bailian_base_url", None),
         vision_extract_model=getattr(args, "vision_extract_model", None),
         text_reason_model=getattr(args, "text_reason_model", None),
+        pdf_render_dpi=getattr(args, "pdf_render_dpi", None),
+        pdf_triage_page_threshold=getattr(args, "pdf_triage_page_threshold", None),
     )
     config = load_config(cli_overrides=overrides)
 

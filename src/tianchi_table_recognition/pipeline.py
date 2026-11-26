@@ -7,6 +7,7 @@ import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, TypeAdapter
 
@@ -14,11 +15,13 @@ from tianchi_table_recognition.config import AppConfig
 from tianchi_table_recognition.dataset import load_dataset, load_submission_template
 from tianchi_table_recognition.gateway import ComplianceError, ModelGateway, ModelTransport
 from tianchi_table_recognition.io_utils import atomic_write_text
-from tianchi_table_recognition.models import PageArtifact, QuestionResult
+from tianchi_table_recognition.models import Question, QuestionResult
+from tianchi_table_recognition.preprocessing import OriginalPageStore
 from tianchi_table_recognition.stage1 import (
+    DocumentExtractionResult,
     PageArtifactCache,
     VisionPageExtractor,
-    extract_image_document,
+    extract_document,
 )
 from tianchi_table_recognition.stage2 import ExtractSolver
 from tianchi_table_recognition.submission import SubmissionExportResult, export_submission
@@ -86,7 +89,7 @@ def run_pipeline(
     )
 
     # Save local Run metadata mapping DocumentKey -> Source Document (never passed to models).
-    run_meta = {
+    run_meta: dict[str, Any] = {
         "run_id": active_run_id,
         "created_at": datetime.now(UTC).isoformat(),
         "selected_ids": list(selected_ids) if selected_ids else None,
@@ -114,30 +117,54 @@ def run_pipeline(
         run_id=active_run_id,
         ledger_path=run_dir / "audit_ledger.jsonl",
     )
-    cache = PageArtifactCache(config.work_dir / "cache")
+    cache_dir = config.work_dir / "cache"
+    cache = PageArtifactCache(cache_dir)
+    page_store = OriginalPageStore(cache_dir)
     extractor = VisionPageExtractor(gateway=gateway)
     validator = AnswerValidator(gateway=gateway)
     solver = ExtractSolver(gateway=gateway, validator=validator)
 
-    artifacts_by_doc: dict[str, PageArtifact] = {}
+    questions_by_doc: dict[str, list[Question]] = {}
+    for question in loaded.questions:
+        questions_by_doc.setdefault(question.document_key, []).append(question)
+
+    extractions_by_doc: dict[str, DocumentExtractionResult] = {}
     stage1_errors: dict[str, str] = {}
     for doc_key, doc_ref in loaded.documents.items():
         try:
-            artifacts_by_doc[doc_key] = extract_image_document(
+            extractions_by_doc[doc_key] = extract_document(
                 doc_ref=doc_ref,
                 gateway=gateway,
                 cache=cache,
+                questions=questions_by_doc.get(doc_key, ()),
+                page_store=page_store,
                 extractor=extractor,
+                pdf_render_dpi=config.pdf_render_dpi,
+                pdf_triage_page_threshold=config.pdf_triage_page_threshold,
+                pdf_triage_thumbnail_dpi=config.pdf_triage_thumbnail_dpi,
             )
         except ComplianceError:
             raise
         except Exception as exc:
             stage1_errors[doc_key] = str(exc)
 
+    run_meta["stage1_summary"] = {
+        key: {
+            "page_count": res.page_count,
+            "triage_mode": res.triage_mode,
+            "extracted_pages": list(res.candidate_pages),
+        }
+        for key, res in extractions_by_doc.items()
+    }
+    atomic_write_text(
+        run_dir / "run_meta.json",
+        json.dumps(run_meta, ensure_ascii=False, indent=2),
+    )
+
     results_by_id: dict[str, QuestionResult] = {}
     for question in loaded.questions:
-        artifact = artifacts_by_doc.get(question.document_key)
-        if artifact is None:
+        extraction = extractions_by_doc.get(question.document_key)
+        if extraction is None:
             results_by_id[question.id] = QuestionResult(
                 question_id=question.id,
                 document_key=question.document_key,
@@ -147,7 +174,7 @@ def run_pipeline(
                 error=stage1_errors.get(question.document_key, "Stage 1 extraction missing"),
             )
             continue
-        results_by_id[question.id] = solver.solve(question, artifact)
+        results_by_id[question.id] = solver.solve(question, extraction.artifacts)
 
     serialized_results = _RESULTS_ADAPTER.dump_json(results_by_id, indent=2).decode("utf-8")
     atomic_write_text(run_dir / "results.json", serialized_results)

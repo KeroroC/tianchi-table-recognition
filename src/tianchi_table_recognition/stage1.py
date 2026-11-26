@@ -2,26 +2,34 @@
 
 from __future__ import annotations
 
-import base64
 import hashlib
-import io
 import json
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
-from PIL import Image, ImageOps
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from tianchi_table_recognition.gateway import EncodedImage, ModelGateway
 from tianchi_table_recognition.io_utils import atomic_write_text
 from tianchi_table_recognition.models import (
     ModelRole,
     PageArtifact,
+    Question,
     SourceDocumentRef,
     TableGrid,
 )
+from tianchi_table_recognition.preprocessing import (
+    PDF_MEDIA_TYPE,
+    SUPPORTED_IMAGE_MEDIA_TYPES,
+    OriginalPageStore,
+    PreparedPage,
+    encode_prepared_page,
+    inspect_pdf,
+)
+from tianchi_table_recognition.triage import triage_long_pdf
 
 DEFAULT_STAGE1_SYSTEM_PROMPT = (
     "You are an expert multimodal table structure and content extractor. "
@@ -94,6 +102,11 @@ class PageArtifactCache:
     def __init__(self, cache_dir: Path) -> None:
         self._root = cache_dir / "page_artifacts"
 
+    @property
+    def cache_dir(self) -> Path:
+        """Root cache directory containing page_artifacts and related caches."""
+        return self._root.parent
+
     def path_for(self, key: CacheKey) -> Path:
         """Return deterministic file path for a CacheKey."""
         return self._root / f"{key.document_hash[:16]}_p{key.page_index}_{key.digest()[:16]}.json"
@@ -132,18 +145,6 @@ class PageExtractor(Protocol):
         image: EncodedImage,
         page_index: int = 0,
     ) -> PageArtifact: ...
-
-
-def encode_image_file(source_path: Path) -> EncodedImage:
-    """Load an image, apply EXIF orientation, and re-encode as clean PNG base64."""
-    with Image.open(source_path) as raw_img:
-        transposed = ImageOps.exif_transpose(raw_img)
-        rgb = transposed.convert("RGB")
-        width, height = rgb.size
-        buf = io.BytesIO()
-        rgb.save(buf, format="PNG")
-    encoded = base64.b64encode(buf.getvalue()).decode("ascii")
-    return EncodedImage(mime_type="image/png", data_base64=encoded, width=width, height=height)
 
 
 def _strip_json_fences(raw_text: str) -> str:
@@ -231,6 +232,133 @@ class VisionPageExtractor:
         )
 
 
+class DocumentExtractionResult(BaseModel):
+    """Page-atomic Stage 1 extraction outputs for a single Source Document."""
+
+    model_config = ConfigDict(frozen=True)
+
+    document_key: str
+    page_count: int = Field(ge=1)
+    triage_mode: Literal["single_image", "short_document", "native_text", "vision_triage"]
+    artifacts: tuple[PageArtifact, ...]
+    preserved_pages: tuple[PreparedPage, ...]
+    candidate_pages: tuple[int, ...]
+
+
+def _extract_or_load_page(
+    *,
+    doc_ref: SourceDocumentRef,
+    prepared: PreparedPage,
+    cache: PageArtifactCache,
+    extractor: PageExtractor,
+    model_id: str,
+) -> PageArtifact:
+    key = CacheKey(
+        document_hash=doc_ref.document_hash,
+        stage=extractor.stage,
+        stage_version=extractor.stage_version,
+        model_id=model_id,
+        prompt_hash=extractor.prompt_hash,
+        page_index=prepared.page_index,
+    )
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+
+    encoded = encode_prepared_page(prepared)
+    artifact = extractor.extract_page(
+        document_key=doc_ref.document_key,
+        document_hash=doc_ref.document_hash,
+        image=encoded,
+        page_index=prepared.page_index,
+    )
+    cache.put(key, artifact)
+    return artifact
+
+
+def extract_document(
+    *,
+    doc_ref: SourceDocumentRef,
+    gateway: ModelGateway,
+    cache: PageArtifactCache,
+    questions: Sequence[Question] = (),
+    page_store: OriginalPageStore | None = None,
+    extractor: PageExtractor | None = None,
+    pdf_render_dpi: int = 300,
+    pdf_triage_page_threshold: int = 8,
+    pdf_triage_thumbnail_dpi: int = 72,
+) -> DocumentExtractionResult:
+    """Extract and atomically cache page-level PageArtifacts for image or PDF Source Documents."""
+    active_store = page_store or OriginalPageStore(cache.cache_dir)
+    active_extractor = extractor or VisionPageExtractor(gateway=gateway)
+    model_id = gateway.model_for_role(ModelRole.VISION_EXTRACT)
+
+    if doc_ref.media_type in SUPPORTED_IMAGE_MEDIA_TYPES:
+        prepared = active_store.preserve_image_document(doc_ref)
+        artifact = _extract_or_load_page(
+            doc_ref=doc_ref,
+            prepared=prepared,
+            cache=cache,
+            extractor=active_extractor,
+            model_id=model_id,
+        )
+        return DocumentExtractionResult(
+            document_key=doc_ref.document_key,
+            page_count=1,
+            triage_mode="single_image",
+            artifacts=(artifact,),
+            preserved_pages=(prepared,),
+            candidate_pages=(0,),
+        )
+
+    if doc_ref.media_type != PDF_MEDIA_TYPE:
+        raise ValueError(
+            f"Unsupported Source Document media_type {doc_ref.media_type!r} "
+            f"for {doc_ref.document_key}"
+        )
+
+    inspection = inspect_pdf(doc_ref.source_path)
+    if inspection.page_count <= pdf_triage_page_threshold:
+        triage_mode: Literal["short_document", "native_text", "vision_triage"] = "short_document"
+        selected_pages = tuple(range(inspection.page_count))
+    else:
+        triage = triage_long_pdf(
+            doc_ref=doc_ref,
+            inspection=inspection,
+            questions=questions,
+            gateway=gateway,
+            page_store=active_store,
+            thumbnail_dpi=pdf_triage_thumbnail_dpi,
+            cache_dir=cache.cache_dir,
+        )
+        triage_mode = triage.mode
+        selected_pages = tuple(sorted(set(triage.candidate_pages)))
+
+    artifacts: list[PageArtifact] = []
+    preserved_pages: list[PreparedPage] = []
+    for page_index in selected_pages:
+        prepared = active_store.render_pdf_page(doc_ref, page_index, dpi=pdf_render_dpi)
+        preserved_pages.append(prepared)
+        artifacts.append(
+            _extract_or_load_page(
+                doc_ref=doc_ref,
+                prepared=prepared,
+                cache=cache,
+                extractor=active_extractor,
+                model_id=model_id,
+            )
+        )
+
+    return DocumentExtractionResult(
+        document_key=doc_ref.document_key,
+        page_count=inspection.page_count,
+        triage_mode=triage_mode,
+        artifacts=tuple(artifacts),
+        preserved_pages=tuple(preserved_pages),
+        candidate_pages=selected_pages,
+    )
+
+
 def extract_image_document(
     *,
     doc_ref: SourceDocumentRef,
@@ -239,31 +367,14 @@ def extract_image_document(
     extractor: PageExtractor | None = None,
 ) -> PageArtifact:
     """Extract and atomically cache PageArtifact for a single-image Source Document."""
-    if doc_ref.media_type == "application/pdf":
+    if doc_ref.media_type == PDF_MEDIA_TYPE:
         raise NotImplementedError(
-            f"PDF Source Document {doc_ref.document_key} requires T3 PDF rendering support."
+            f"PDF Source Document {doc_ref.document_key} requires extract_document."
         )
-
-    active_extractor = extractor or VisionPageExtractor(gateway=gateway)
-    model_id = gateway.model_for_role(ModelRole.VISION_EXTRACT)
-    key = CacheKey(
-        document_hash=doc_ref.document_hash,
-        stage=active_extractor.stage,
-        stage_version=active_extractor.stage_version,
-        model_id=model_id,
-        prompt_hash=active_extractor.prompt_hash,
-        page_index=0,
+    result = extract_document(
+        doc_ref=doc_ref,
+        gateway=gateway,
+        cache=cache,
+        extractor=extractor,
     )
-    cached = cache.get(key)
-    if cached is not None:
-        return cached
-
-    encoded = encode_image_file(doc_ref.source_path)
-    artifact = active_extractor.extract_page(
-        document_key=doc_ref.document_key,
-        document_hash=doc_ref.document_hash,
-        image=encoded,
-        page_index=0,
-    )
-    cache.put(key, artifact)
-    return artifact
+    return result.artifacts[0]

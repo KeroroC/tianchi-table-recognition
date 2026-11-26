@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 
 from tianchi_table_recognition.gateway import ComplianceError, ModelGateway
+from tianchi_table_recognition.locator import TableLocator
 from tianchi_table_recognition.models import (
     ModelRole,
     PageArtifact,
@@ -32,13 +34,19 @@ class ExtractSolver:
         *,
         system_prompt: str = DEFAULT_EXTRACT_SYSTEM_PROMPT,
         validator: AnswerValidator | None = None,
+        locator: TableLocator | None = None,
     ) -> None:
         self._gateway = gateway
         self._system_prompt = system_prompt
         self._validator = validator or AnswerValidator(gateway=gateway)
+        self._locator = locator or TableLocator()
 
-    def solve(self, question: Question, artifact: PageArtifact) -> QuestionResult:
-        """Solve a single extract Question using its anonymized PageArtifact."""
+    def solve(
+        self,
+        question: Question,
+        artifact: PageArtifact | Sequence[PageArtifact],
+    ) -> QuestionResult:
+        """Solve a single extract Question using located page-atomic PageArtifacts."""
         if question.question_type != QuestionType.EXTRACT:
             return QuestionResult(
                 question_id=question.id,
@@ -52,14 +60,30 @@ class ExtractSolver:
                 ),
             )
 
-        tables_payload = [table.model_dump(mode="json") for table in artifact.tables]
+        artifacts = [artifact] if isinstance(artifact, PageArtifact) else list(artifact)
+        located = self._locator.locate(question, artifacts)
+        page_context = "\n".join(
+            f"[page {page.page_index}] {page.page_context_text}"
+            for page in located.pages
+            if page.page_context_text
+        )
+        tables_payload = [
+            {
+                "page_index": item.page_index,
+                "is_continuation": item.is_continuation,
+                **item.table.model_dump(mode="json"),
+            }
+            for item in located.tables
+        ]
+        cross_flag = "true" if located.has_cross_page_continuation else "false"
         user_prompt = "\n".join(
             [
                 f"DocumentKey: {question.document_key}",
                 f"Question: {question.question}",
                 f"TableHint: {question.table_hint or ''}",
                 f"AnswerFormat: {question.answer_format.value}",
-                f"PageContext: {artifact.page_context_text}",
+                f"CrossPageContinuation: {cross_flag}",
+                f"PageContext: {page_context}",
                 f"TablesJSON: {json.dumps(tables_payload, ensure_ascii=False)}",
             ]
         )
@@ -76,7 +100,7 @@ class ExtractSolver:
             validation = self._validator.validate(
                 question,
                 response.content,
-                artifact=artifact,
+                artifact=located.pages,
             )
             is_valid = validation.is_valid and validation.answer is not None
             return QuestionResult(

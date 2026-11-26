@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, Literal
@@ -611,14 +612,16 @@ def _validate_number(question: Question, raw_answer: str) -> ValidationResult:
     )
 
 
-def _artifact_source_texts(artifact: PageArtifact) -> list[str]:
+def _artifact_source_texts(artifact: PageArtifact | Sequence[PageArtifact]) -> list[str]:
+    artifacts = [artifact] if isinstance(artifact, PageArtifact) else list(artifact)
     texts: list[str] = []
-    if artifact.page_context_text:
-        texts.append(artifact.page_context_text)
-    for table in artifact.tables:
-        for cell in table.cells:
-            if cell.text:
-                texts.append(cell.text)
+    for page in artifacts:
+        if page.page_context_text:
+            texts.append(page.page_context_text)
+        for table in page.tables:
+            for cell in table.cells:
+                if cell.text:
+                    texts.append(cell.text)
     return texts
 
 
@@ -655,7 +658,7 @@ def _has_structural_spurious_space(text: str) -> str | None:
 def _validate_string(
     raw_answer: str,
     *,
-    artifact: PageArtifact | None = None,
+    artifact: PageArtifact | Sequence[PageArtifact] | None = None,
 ) -> ValidationResult:
     cleaned = _strip_explanatory_prefix_and_fences(raw_answer)
     if not cleaned:
@@ -823,7 +826,7 @@ class AnswerValidator:
         question: Question,
         raw_answer: str,
         *,
-        artifact: PageArtifact | None = None,
+        artifact: PageArtifact | Sequence[PageArtifact] | None = None,
     ) -> ValidationResult:
         """Validate and normalize a candidate answer according to question.answer_format."""
         if question.answer_format in (AnswerFormat.JSON, AnswerFormat.JSON_ARRAY):
