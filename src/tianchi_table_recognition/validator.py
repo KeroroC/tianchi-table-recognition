@@ -12,7 +12,14 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict
 
 from tianchi_table_recognition.gateway import ComplianceError, ModelGateway
-from tianchi_table_recognition.models import AnswerFormat, ModelRole, PageArtifact, Question
+from tianchi_table_recognition.models import (
+    AnswerFormat,
+    ModelRole,
+    PageArtifact,
+    Question,
+    QuestionResult,
+    SolverPath,
+)
 
 _ZERO_WIDTH_CHARS = "\ufeff\u200b\u200c\u200d"
 _FENCED_BLOCK_RE = re.compile(r"```(?:json)?\s*\n?(.*?)\n?```", re.DOTALL | re.IGNORECASE)
@@ -836,3 +843,37 @@ class AnswerValidator:
         if question.answer_format == AnswerFormat.STRING:
             return _validate_string(raw_answer, artifact=artifact)
         raise NotImplementedError(f"Unsupported answer_format={question.answer_format}")
+
+
+def validate_and_build_result(
+    *,
+    validator: AnswerValidator,
+    question: Question,
+    raw_answer: str,
+    artifact: PageArtifact | Sequence[PageArtifact] | None,
+    solver_path: SolverPath,
+    fallback_no_python: bool = False,
+    python_retry_count: int = 0,
+    vision_verified: bool = False,
+) -> QuestionResult:
+    """Validate a raw candidate answer and construct a QuestionResult."""
+    validation = validator.validate(question, raw_answer, artifact=artifact)
+    is_valid = validation.is_valid and validation.answer is not None
+    return QuestionResult(
+        question_id=question.id,
+        document_key=question.document_key,
+        question_type=question.question_type,
+        answer_format=question.answer_format,
+        status="ok" if is_valid else "failed",
+        answer=validation.answer if is_valid else None,
+        error=None
+        if is_valid
+        else ("; ".join(validation.errors) or "Answer validation failed"),
+        raw_answer=raw_answer,
+        validation_errors=() if is_valid else validation.errors,
+        json_repaired=validation.repaired,
+        solver_path=solver_path,
+        fallback_no_python=fallback_no_python,
+        python_retry_count=python_retry_count,
+        vision_verified=vision_verified,
+    )

@@ -44,6 +44,16 @@ class TriageMode(StrEnum):
     VISION_TRIAGE = "vision_triage"
 
 
+class SolverPath(StrEnum):
+    """Stage 2 execution path recorded on QuestionResult."""
+
+    EXTRACT = "extract"
+    THINKING_PYTHON = "thinking_python"
+    FALLBACK_NO_PYTHON = "fallback_no_python"
+    STRUCTURE_DETERMINISTIC = "structure_deterministic"
+    STRUCTURE_VISION_VERIFY = "structure_vision_verify"
+
+
 class Question(BaseModel):
     """Single evaluation item stripped of original Source Document filenames."""
 
@@ -142,3 +152,7 @@ class QuestionResult(BaseModel):
     raw_answer: str | None = None
     validation_errors: tuple[str, ...] = ()
     json_repaired: bool = False
+    solver_path: SolverPath | None = None
+    fallback_no_python: bool = False
+    python_retry_count: int = Field(default=0, ge=0)
+    vision_verified: bool = False

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
@@ -257,3 +259,55 @@ class TableLocator:
             tables=located_tables,
             has_cross_page_continuation=any(lt.is_continuation for lt in located_tables),
         )
+
+
+class LocatedPromptContext(BaseModel):
+    """Serialized Stage 2 prompt/context bundle built from a LocatedContext."""
+
+    model_config = ConfigDict(frozen=True)
+
+    page_context: str
+    tables_payload: list[dict[str, Any]]
+    has_cross_page_continuation: bool
+
+    def format_user_prompt(
+        self,
+        question: Question,
+        *,
+        extra_lines: Sequence[str] = (),
+    ) -> str:
+        """Render a compliant DocumentKey-only Stage 2 user prompt."""
+        cross_flag = "true" if self.has_cross_page_continuation else "false"
+        lines = [
+            f"DocumentKey: {question.document_key}",
+            f"Question: {question.question}",
+            f"TableHint: {question.table_hint or ''}",
+            f"AnswerFormat: {question.answer_format.value}",
+            *extra_lines,
+            f"CrossPageContinuation: {cross_flag}",
+            f"PageContext: {self.page_context}",
+            f"TablesJSON: {json.dumps(self.tables_payload, ensure_ascii=False)}",
+        ]
+        return "\n".join(lines)
+
+
+def build_located_payload(located: LocatedContext) -> LocatedPromptContext:
+    """Serialize located PageArtifacts and TableGrids into Stage 2 prompt/context payloads."""
+    page_context = "\n".join(
+        f"[page {page.page_index}] {page.page_context_text}"
+        for page in located.pages
+        if page.page_context_text
+    )
+    tables_payload = [
+        {
+            "page_index": item.page_index,
+            "is_continuation": item.is_continuation,
+            **item.table.model_dump(mode="json"),
+        }
+        for item in located.tables
+    ]
+    return LocatedPromptContext(
+        page_context=page_context,
+        tables_payload=tables_payload,
+        has_cross_page_continuation=located.has_cross_page_continuation,
+    )

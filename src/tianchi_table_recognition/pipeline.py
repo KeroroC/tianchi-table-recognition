@@ -23,7 +23,7 @@ from tianchi_table_recognition.stage1 import (
     VisionPageExtractor,
     extract_document,
 )
-from tianchi_table_recognition.stage2 import ExtractSolver
+from tianchi_table_recognition.stage2 import Stage2Router
 from tianchi_table_recognition.submission import SubmissionExportResult, export_submission
 from tianchi_table_recognition.validator import AnswerValidator
 
@@ -122,7 +122,7 @@ def run_pipeline(
     page_store = OriginalPageStore(cache_dir)
     extractor = VisionPageExtractor(gateway=gateway)
     validator = AnswerValidator(gateway=gateway)
-    solver = ExtractSolver(gateway=gateway, validator=validator)
+    solver = Stage2Router(gateway=gateway, validator=validator)
 
     questions_by_doc: dict[str, list[Question]] = {}
     for question in loaded.questions:
@@ -174,7 +174,33 @@ def run_pipeline(
                 error=stage1_errors.get(question.document_key, "Stage 1 extraction missing"),
             )
             continue
-        results_by_id[question.id] = solver.solve(question, extraction.artifacts)
+        results_by_id[question.id] = solver.solve(
+            question,
+            extraction.artifacts,
+            preserved_pages=extraction.preserved_pages,
+        )
+
+    solver_path_counts: dict[str, int] = {}
+    fallback_no_python_ids: list[str] = []
+    vision_verified_count = 0
+    for qid, res in results_by_id.items():
+        if res.solver_path:
+            solver_path_counts[res.solver_path] = solver_path_counts.get(res.solver_path, 0) + 1
+        if res.fallback_no_python:
+            fallback_no_python_ids.append(qid)
+        if res.vision_verified:
+            vision_verified_count += 1
+
+    run_meta["stage2_summary"] = {
+        "solver_path_counts": solver_path_counts,
+        "fallback_no_python_count": len(fallback_no_python_ids),
+        "fallback_no_python_ids": fallback_no_python_ids,
+        "vision_verified_count": vision_verified_count,
+    }
+    atomic_write_text(
+        run_dir / "run_meta.json",
+        json.dumps(run_meta, ensure_ascii=False, indent=2),
+    )
 
     serialized_results = _RESULTS_ADAPTER.dump_json(results_by_id, indent=2).decode("utf-8")
     atomic_write_text(run_dir / "results.json", serialized_results)

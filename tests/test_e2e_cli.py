@@ -971,3 +971,281 @@ def test_e2e_cli_multiformat_exif_short_pdf_and_long_native_scanned_pdfs(
     assert transport.count_calls(ModelRole.VISION_EXTRACT) == 9
     assert transport.count_calls(ModelRole.VISION_TRIAGE) == 3
     assert transport.count_calls(ModelRole.TEXT_REASON) == 10
+
+
+def test_e2e_cli_stage2_routing_decimal_sandbox_fallback_and_structure_solver(
+    tmp_path: Path,
+) -> None:
+    dataset_dir = tmp_path / "ds_t4"
+    docs_dir = dataset_dir / "docs"
+    forbidden = [
+        "secret_t4_clean.png",
+        "secret_t4_uncertain.png",
+        "secret_t4_cross_2p.pdf",
+    ]
+    create_synthetic_image(docs_dir / forbidden[0], label="T4-CLEAN")
+    create_synthetic_image(docs_dir / forbidden[1], label="T4-UNC")
+    create_synthetic_text_pdf(
+        docs_dir / forbidden[2],
+        ["第一页 资产负债表\n项目 金额\n货币资金 100", "资产负债表（续）\n项目 金额\n负债合计 50"],
+        width_pt=288.0,
+        height_pt=144.0,
+    )
+
+    rows = [
+        SyntheticQuestionRow(
+            "001", forbidden[0], "extract", "公司名称是什么？", "净值表", "string"
+        ),
+        SyntheticQuestionRow(
+            "002", forbidden[0], "thinking", "一月和二月金额之和是多少？", "净值表", "number"
+        ),
+        SyntheticQuestionRow(
+            "003",
+            forbidden[0],
+            "thinking",
+            "三月金额占一月二月之和的百分比是多少？",
+            "净值表",
+            "number",
+        ),
+        SyntheticQuestionRow(
+            "004", forbidden[0], "thinking", "三个月总金额是多少？", "净值表", "number"
+        ),
+        SyntheticQuestionRow(
+            "005", forbidden[0], "structure", "净值表一共有多少行？", "净值表", "number"
+        ),
+        SyntheticQuestionRow(
+            "006", forbidden[1], "structure", "模糊表一共有多少行？", "模糊表", "number"
+        ),
+        SyntheticQuestionRow(
+            "007", forbidden[2], "structure", "资产负债表总共有多少行？", "资产负债表", "number"
+        ),
+    ]
+    write_questions_workbook(dataset_dir / "tests.xlsx", rows)
+    write_submission_template(
+        dataset_dir / "submission_template.xlsx",
+        ["001", "002", "003", "004", "005", "006", "007"],
+    )
+
+    def _cells(
+        rows_data: list[list[str]],
+        *,
+        uncertain_at: tuple[int, int] | None = None,
+    ) -> list[dict[str, object]]:
+        return [
+            {
+                "row": r,
+                "col": c,
+                "text": txt,
+                "uncertain": uncertain_at == (r, c),
+            }
+            for r, row in enumerate(rows_data)
+            for c, txt in enumerate(row)
+        ]
+
+    clean_stage1 = json.dumps(
+        {
+            "page_context_text": "基金净值报告",
+            "tables": [
+                {
+                    "table_id": "t_clean",
+                    "title": "净值表",
+                    "row_count": 5,
+                    "col_count": 2,
+                    "header_row_count": 2,
+                    "cells": _cells(
+                        [
+                            ["公司", "上海示例基金"],
+                            ["月份", "金额"],
+                            ["一月", "0.1"],
+                            ["二月", "0.2"],
+                            ["三月", "0.6"],
+                        ]
+                    ),
+                }
+            ],
+        },
+        ensure_ascii=False,
+    )
+    uncertain_stage1 = json.dumps(
+        {
+            "page_context_text": "模糊扫描件",
+            "tables": [
+                {
+                    "table_id": "t_unc",
+                    "title": "模糊表",
+                    "row_count": 3,
+                    "col_count": 2,
+                    "header_row_count": 1,
+                    "cells": _cells(
+                        [["项目", "值"], ["A", "1"], ["B", "2"]],
+                        uncertain_at=(2, 1),
+                    ),
+                }
+            ],
+        },
+        ensure_ascii=False,
+    )
+    pdf_p0_stage1 = json.dumps(
+        {
+            "page_context_text": "资产负债表",
+            "tables": [
+                {
+                    "table_id": "t_pdf_0",
+                    "title": "资产负债表",
+                    "row_count": 2,
+                    "col_count": 2,
+                    "header_row_count": 1,
+                    "cells": _cells([["项目", "金额"], ["货币资金", "100"]]),
+                }
+            ],
+        },
+        ensure_ascii=False,
+    )
+    pdf_p1_stage1 = json.dumps(
+        {
+            "page_context_text": "资产负债表（续）",
+            "tables": [
+                {
+                    "table_id": "t_pdf_1",
+                    "title": "资产负债表（续）",
+                    "row_count": 2,
+                    "col_count": 2,
+                    "header_row_count": 1,
+                    "cells": _cells([["项目", "金额"], ["负债合计", "50"]]),
+                }
+            ],
+        },
+        ensure_ascii=False,
+    )
+
+    seen_first_png = False
+    q3_attempts = 0
+    q4_attempts = 0
+
+    def _handler(req: TransportRequest) -> TransportResponse:
+        nonlocal seen_first_png, q3_attempts, q4_attempts
+        if req.model_role == ModelRole.VISION_EXTRACT:
+            img = req.images[0]
+            if (img.width, img.height) == (1200, 600):
+                m = re.search(r"page_index:\s*(\d+)", req.user_prompt)
+                assert m is not None
+                pidx = int(m.group(1))
+                return TransportResponse(content=pdf_p0_stage1 if pidx == 0 else pdf_p1_stage1)
+            if not seen_first_png:
+                seen_first_png = True
+                return TransportResponse(content=clean_stage1)
+            return TransportResponse(content=uncertain_stage1)
+
+        if req.model_role == ModelRole.VISION_VERIFY:
+            if req.question_id == "006":
+                assert len(req.images) == 1
+                return TransportResponse(content="4")
+            if req.question_id == "007":
+                assert len(req.images) == 2
+                return TransportResponse(content="3")
+            raise AssertionError(f"Unexpected VISION_VERIFY question: {req.question_id}")
+
+        assert req.model_role == ModelRole.TEXT_REASON
+        if req.question_id == "001":
+            return TransportResponse(content="上海示例基金")
+        if req.question_id == "002":
+            return TransportResponse(
+                content=(
+                    "```python\n"
+                    "from decimal import Decimal\n"
+                    "RESULT = Decimal('0.1') + Decimal('0.2')\n"
+                    "```"
+                )
+            )
+        if req.question_id == "003":
+            q3_attempts += 1
+            if q3_attempts == 1:
+                assert req.stage == "stage2_thinking_codegen"
+                return TransportResponse(content="import os\nRESULT = 200")
+            assert req.stage == "stage2_thinking_codegen_repair"
+            assert "ast_rejected" in req.user_prompt
+            return TransportResponse(
+                content=(
+                    "from decimal import Decimal\n"
+                    "RESULT = (Decimal('0.6') / (Decimal('0.1') + Decimal('0.2'))) * Decimal('100')"
+                )
+            )
+        if req.question_id == "004":
+            q4_attempts += 1
+            if req.stage == "stage2_thinking_codegen":
+                return TransportResponse(content="import subprocess\nRESULT = 1")
+            if req.stage == "stage2_thinking_codegen_repair":
+                return TransportResponse(content="RESULT = eval('1 + 1')")
+            assert req.stage == "stage2_thinking_fallback"
+            return TransportResponse(content="0.9")
+        raise AssertionError(f"Unexpected TEXT_REASON request: {req}")
+
+    work_dir = tmp_path / "work"
+    out_xlsx = work_dir / "submissions" / "t4_submission.xlsx"
+    transport = FakeModelTransport(handler=_handler)
+
+    rc = main(
+        [
+            "run",
+            "--dataset-dir",
+            str(dataset_dir),
+            "--documents-dir",
+            "docs",
+            "--work-dir",
+            str(work_dir),
+            "--run-id",
+            "t4_run_1",
+            "--output",
+            str(out_xlsx),
+        ],
+        transport=transport,
+    )
+
+    assert rc == 0
+    transport.assert_no_filename_leak(forbidden)
+    assert transport.count_calls(ModelRole.VISION_VERIFY) == 2
+
+    results_data = json.loads(
+        (work_dir / "runs" / "t4_run_1" / "results.json").read_text(encoding="utf-8")
+    )
+    assert results_data["001"]["solver_path"] == "extract"
+    assert results_data["002"]["solver_path"] == "thinking_python"
+    assert results_data["002"]["python_retry_count"] == 0
+    assert results_data["003"]["solver_path"] == "thinking_python"
+    assert results_data["003"]["python_retry_count"] == 1
+    assert results_data["004"]["solver_path"] == "fallback_no_python"
+    assert results_data["004"]["fallback_no_python"] is True
+    assert results_data["004"]["python_retry_count"] == 1
+    assert results_data["005"]["solver_path"] == "structure_deterministic"
+    assert results_data["005"]["vision_verified"] is False
+    assert results_data["006"]["solver_path"] == "structure_vision_verify"
+    assert results_data["006"]["vision_verified"] is True
+    assert results_data["007"]["solver_path"] == "structure_vision_verify"
+    assert results_data["007"]["vision_verified"] is True
+
+    run_meta = json.loads(
+        (work_dir / "runs" / "t4_run_1" / "run_meta.json").read_text(encoding="utf-8")
+    )
+    assert run_meta["stage2_summary"]["fallback_no_python_count"] == 1
+    assert run_meta["stage2_summary"]["fallback_no_python_ids"] == ["004"]
+    assert run_meta["stage2_summary"]["vision_verified_count"] == 2
+
+    wb = load_workbook(out_xlsx, data_only=False)
+    try:
+        ws = wb.active
+        assert ws is not None
+        assert [
+            (ws.cell(r, 1).value, ws.cell(r, 2).value, ws.cell(r, 2).number_format)
+            for r in range(1, ws.max_row + 1)
+        ] == [
+            ("id", "answer", "@"),
+            ("001", "上海示例基金", "@"),
+            ("002", "0.3", "@"),
+            ("003", "200", "@"),
+            ("004", "0.9", "@"),
+            ("005", "5", "@"),
+            ("006", "4", "@"),
+            ("007", "3", "@"),
+        ]
+    finally:
+        wb.close()
